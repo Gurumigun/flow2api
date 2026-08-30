@@ -38,6 +38,16 @@ class _ImmediateExtensionSocket:
     async def send_text(self, data):
         payload = json.loads(data)
         if payload.get("type") != "get_token":
+            if payload.get("type") == "get_session_cookie":
+                await self.service.handle_message(
+                    self,
+                    json.dumps({
+                        "type": "session_cookie_result",
+                        "req_id": payload["req_id"],
+                        "status": "success",
+                        "session_token": "labs-session-token",
+                    }),
+                )
             return
         self.dispatch_times.append(time.monotonic())
         await self.service.handle_message(
@@ -111,6 +121,17 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(results, ["captcha-1", "captcha-2"])
         self.assertGreaterEqual(websocket.dispatch_times[1] - websocket.dispatch_times[0], 0.045)
+
+    async def test_session_cookie_can_be_read_for_mapped_profile(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service)
+        service.active_connections.append(
+            ExtensionConnection(websocket=websocket, route_key="google-1")
+        )
+
+        session_token = await service.get_session_token(token_id=1)
+
+        self.assertEqual(session_token, "labs-session-token")
 
 
 class RecaptchaRetryBudgetTests(unittest.TestCase):

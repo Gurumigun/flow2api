@@ -214,6 +214,57 @@ class ExtensionCaptchaService:
                 timeout=timeout,
             )
 
+    async def get_session_token(self, token_id: Optional[int], timeout: int = 15) -> Optional[str]:
+        """Read the current labs.google session cookie from the mapped profile."""
+        if not self.active_connections:
+            raise RuntimeError("Chrome Extension not connected")
+
+        route_key = await self._resolve_route_key(token_id)
+        conn = self._select_connection(route_key)
+        if conn is None:
+            raise RuntimeError(
+                f"No Chrome Extension connection matches token_id={token_id} route_key='{route_key}'"
+            )
+
+        route_guard_key = route_key or "(empty)"
+        route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
+        async with route_lock:
+            conn = self._select_connection(route_key)
+            if conn is None:
+                raise RuntimeError(f"Chrome Extension disconnected for route_key='{route_key}'")
+
+            req_id = f"req_{uuid.uuid4().hex}"
+            future = asyncio.get_running_loop().create_future()
+            self.pending_requests[req_id] = (future, conn.websocket)
+            try:
+                async with self._global_dispatch_lock:
+                    global_interval = config.extension_global_min_interval_seconds
+                    wait_seconds = max(
+                        0.0,
+                        global_interval - (time.monotonic() - self._global_last_dispatch_at),
+                    )
+                    if wait_seconds > 0:
+                        await asyncio.sleep(wait_seconds)
+                    self._global_last_dispatch_at = time.monotonic()
+
+                await conn.websocket.send_text(json.dumps({
+                    "type": "get_session_cookie",
+                    "req_id": req_id,
+                    "route_key": route_key,
+                }))
+                result = await asyncio.wait_for(future, timeout=timeout)
+                if result.get("status") == "success":
+                    return str(result.get("session_token") or "").strip() or None
+                debug_logger.log_warning(
+                    f"[Extension Captcha] Session cookie request failed: {result.get('error')}"
+                )
+                return None
+            except asyncio.TimeoutError:
+                debug_logger.log_warning("[Extension Captcha] Session cookie request timed out")
+                return None
+            finally:
+                self.pending_requests.pop(req_id, None)
+
     async def _dispatch_token_request(
         self,
         *,
