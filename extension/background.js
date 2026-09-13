@@ -708,6 +708,61 @@ async function fetchCurrentFlowImage(rawUrl) {
     );
 }
 
+async function fetchCurrentFlowImageFromTab(tabId, rawUrl) {
+    const sourceUrl = String(rawUrl || "").trim();
+    if (!tabId || !isCurrentFlowImageUrl(sourceUrl)) {
+        throw new Error("Flow UI returned an unsupported image URL");
+    }
+    const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: async url => {
+            const candidates = [];
+            if (/=s\d+(?:-[a-z0-9-]+)?(?=$|[?#])/i.test(url)) {
+                candidates.push(url.replace(
+                    /=s\d+(?:-[a-z0-9-]+)?(?=$|[?#])/i,
+                    "=s2048-rw",
+                ));
+            }
+            candidates.push(url);
+            let lastStatus = 0;
+            for (const candidate of [...new Set(candidates)]) {
+                try {
+                    const response = await fetch(candidate, {
+                        credentials: "include",
+                        signal: AbortSignal.timeout(10000),
+                    });
+                    lastStatus = response.status;
+                    const mimeType = String(response.headers.get("content-type") || "")
+                        .split(";", 1)[0]
+                        .trim();
+                    if (!response.ok || !mimeType.startsWith("image/")) continue;
+                    const bytes = new Uint8Array(await response.arrayBuffer());
+                    if (!bytes.length || bytes.length > 20_000_000) continue;
+                    let binary = "";
+                    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+                        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+                    }
+                    return {
+                        encodedImage: btoa(binary),
+                        mimeType,
+                        url: candidate,
+                    };
+                } catch (_) {
+                    // The extension worker fallback below has broader host access.
+                }
+            }
+            throw new Error(`Flow page image download failed (HTTP ${lastStatus || "unknown"})`);
+        },
+        args: [sourceUrl],
+    });
+    const payload = results && results[0] && results[0].result;
+    if (!payload || !payload.encodedImage || !String(payload.mimeType || "").startsWith("image/")) {
+        throw new Error("Flow page returned no downloadable image");
+    }
+    return payload;
+}
+
 // Google recompresses uploads, so byte hashes cannot distinguish a reference
 // thumbnail from a newly generated image. Decode in the extension worker,
 // whose existing host permissions allow reading Flow's image pixels.
@@ -750,7 +805,9 @@ function createFlowResultValidator(uploads, download = fetchCurrentFlowImage, fi
         accepted,
         async check(asset) {
             // Validate before fetching; page-visible candidates cannot change destinations.
-            if (!asset || !asset.identity || !isCurrentFlowImageUrl(asset.url)) return { status: "error" };
+            if (!asset || !asset.identity || !isCurrentFlowImageUrl(asset.url)) {
+                return { status: "error", reason: "invalid_asset" };
+            }
             const cacheKey = `${asset.identity}|${asset.url}`;
             if (checked.has(cacheKey)) return checked.get(cacheKey);
             if (checked.size >= 32) return { status: "error" };
@@ -764,9 +821,14 @@ function createFlowResultValidator(uploads, download = fetchCurrentFlowImage, fi
                 const result = { identity: asset.identity, url: asset.url, status };
                 checked.set(cacheKey, result);
                 return result;
-            } catch (_) {
+            } catch (error) {
                 // Never accept an image whose pixels could not be checked.
-                return { identity: asset.identity, url: asset.url, status: "error" };
+                return {
+                    identity: asset.identity,
+                    url: asset.url,
+                    status: "error",
+                    reason: String(error && error.message || "image_check_failed").slice(0, 160),
+                };
             }
         },
     };
@@ -803,12 +865,14 @@ async function validateCurrentFlowImages(responseText, validator) {
     if (payload.flow2apiTransport !== "flow_google_ui" || !Array.isArray(payload.media)) {
         return String(responseText || "");
     }
+    const verdicts = [];
     for (const media of payload.media.slice(0, 16)) {
         const generatedImage = media && media.image && media.image.generatedImage;
         const identity = String(generatedImage && generatedImage.flow2apiIdentity || "");
         const url = String(generatedImage && generatedImage.fifeUrl || "");
         if (generatedImage) delete generatedImage.flow2apiIdentity;
         const verdict = await validator.check({ identity, url });
+        verdicts.push(verdict);
         if (verdict.status === "accepted") {
             // One validated result matches the legacy response contract and keeps
             // post-generation validation bounded even if Flow exposes many assets.
@@ -816,7 +880,11 @@ async function validateCurrentFlowImages(responseText, validator) {
             return JSON.stringify(payload);
         }
     }
-    throw new Error("Flow reference result validation failed; no image was accepted");
+    if (verdicts.some(verdict => verdict.status === "reference")) {
+        throw new Error("Flow result validation found only the uploaded reference image");
+    }
+    const reason = verdicts.find(verdict => verdict.reason)?.reason || "no_candidate";
+    throw new Error(`Flow result image could not be verified (${reason})`);
 }
 
 async function handleGetSessionCookie(data, socket) {
@@ -1083,7 +1151,16 @@ async function handleSubmitFlowRequest(data, socket) {
             const uploads = data.body?.__flow2apiUiContext?.inputUploads || [];
             const inputs = data.body?.requests?.[0]?.imageInputs || [];
             if (uploads.length !== inputs.length) throw new Error("Flow reference result validation requires the original reference bytes");
-            imageValidator = createFlowResultValidator(uploads);
+            imageValidator = createFlowResultValidator(uploads, async url => {
+                try {
+                    // The long MAIN-world generation script has returned before
+                    // validation starts, so this short page-context fetch cannot
+                    // deadlock behind it and inherits Flow's first-party session.
+                    return await fetchCurrentFlowImageFromTab(newTabId, url);
+                } catch (pageError) {
+                    return fetchCurrentFlowImage(url);
+                }
+            });
         }
         if (!usesCurrentFlowUi) {
             ignoredFlowAuthorizationTabIds.add(newTabId);
@@ -1291,11 +1368,13 @@ async function handleSubmitFlowRequest(data, socket) {
                             return null;
                         }
                     };
-                    const currentMediaAssets = () => {
+                    const currentMediaAssets = (includePromptImages = false) => {
                         const assets = new Map();
                         document.querySelectorAll(isVideo ? "video" : "img").forEach(image => {
-                            if (!isVideo && (!image.complete || !image.naturalWidth
-                                || image.closest('flow-prompt-box, flow-add-menu-popover-content, [contenteditable="true"]'))) return;
+                            if (!isVideo && (!image.complete || !image.naturalWidth)) return;
+                            if (!isVideo && image.closest("flow-add-menu-popover-content")) return;
+                            if (!isVideo && !includePromptImages
+                                && image.closest('flow-prompt-box, [contenteditable="true"]')) return;
                             if (isVideo && (!Number.isFinite(image.duration) || image.duration < 7.9)) return;
                             const asset = mediaAssetFromUrl(image.currentSrc || image.src || image.querySelector("source")?.src);
                             if (asset) assets.set(asset.identity, isVideo ? { ...asset, duration: image.duration } : asset);
@@ -1778,9 +1857,12 @@ async function handleSubmitFlowRequest(data, socket) {
                         await pause(500);
                     }
 
-                    const firstBaseline = currentMediaAssets();
+                    // Include the attached prompt thumbnails in the baseline so
+                    // moving the same upload into a conversation card cannot be
+                    // mistaken for a newly generated result.
+                    const firstBaseline = currentMediaAssets(true);
                     await pause(700);
-                    const secondBaseline = currentMediaAssets();
+                    const secondBaseline = currentMediaAssets(true);
                     const baselineIds = new Set([...firstBaseline.keys(), ...secondBaseline.keys()]);
                     const baselineFailureCount = isVideo ? 0 : countFailureSignals();
                     const videoFailureBaseline = isVideo ? readVideoFailures() : null;
@@ -1821,7 +1903,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         const assets = currentMediaAssets();
                         const fresh = Array.from(assets.values())
                             .filter(asset => !baselineIds.has(asset.identity));
-                        if (fresh.length && (isVideo || !generationActive)) {
+                        if (fresh.length) {
                             const ids = fresh.map(asset => asset.identity).sort().join(",");
                             stablePolls = ids === stableIds ? stablePolls + 1 : 1;
                             stableIds = ids;

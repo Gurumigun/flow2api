@@ -551,12 +551,12 @@ class Config:
         """图片请求停留在同一 Flow 页面阶段多久后切换浏览器账号。"""
         value = self._config.get("captcha", {}).get(
             "extension_image_phase_timeout_seconds",
-            95.0,
+            150.0,
         )
         try:
             return max(30.0, min(240.0, float(value)))
         except Exception:
-            return 95.0
+            return 150.0
 
     @property
     def extension_image_result_timeout_seconds(self) -> float:

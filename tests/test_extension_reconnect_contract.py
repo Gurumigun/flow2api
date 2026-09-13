@@ -152,7 +152,7 @@ class ExtensionReconnectContractTests(unittest.TestCase):
 
         self.assertGreaterEqual(
             tuple(int(part) for part in manifest["version"].split(".")),
-            (1, 3, 28),
+            (1, 3, 29),
         )
         self.assertIn('data.type === "cancel_flow_request"', background)
         self.assertIn("cancelFlowSubmitRequest(data)", background)
@@ -177,7 +177,10 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
 
         self.assertIn("validateCurrentFlowImages(responseText, imageValidator)", background)
+        self.assertIn("fetchCurrentFlowImageFromTab(newTabId, url)", background)
         self.assertIn("flow2apiIdentity: asset.identity", background)
+        self.assertIn("const firstBaseline = currentMediaAssets(true)", background)
+        self.assertIn("if (fresh.length)", background)
         self.assertNotIn("__FLOW2API_IMAGE_VERDICT__", background)
         self.assertNotIn("__FLOW2API_IMAGE_CANDIDATES__", background)
 

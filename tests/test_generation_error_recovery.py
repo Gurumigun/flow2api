@@ -60,11 +60,11 @@ class FlowUiDiagnosticsTests(unittest.TestCase):
         from src.services.browser_captcha_extension import ExtensionCaptchaService
 
         with self.assertRaises(ExtensionCaptchaError) as caught:
-            ExtensionCaptchaService._require_image_ui_version("1.3.27")
+            ExtensionCaptchaService._require_image_ui_version("1.3.28")
         self.assertEqual(caught.exception.code, "extension_reload_required")
         with self.assertRaises(ExtensionCaptchaError):
             ExtensionCaptchaService._require_image_ui_version("1.3.23")
-        ExtensionCaptchaService._require_image_ui_version("1.3.28")
+        ExtensionCaptchaService._require_image_ui_version("1.3.29")
 
     def test_missing_project_has_a_specific_recovery_code(self):
         from src.services.browser_captcha_extension import ExtensionCaptchaService
@@ -378,6 +378,9 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
         cache_config["enabled"] = False
         captcha_config["captcha_method"] = "extension"
         captcha_config["extension_transport_generation_retries"] = 2
+        # Keep this recovery-unit test's synthetic second-attempt budget
+        # independent from the longer production generation phase limit.
+        captcha_config["extension_image_phase_timeout_seconds"] = 95
         try:
             chunks = [
                 chunk
