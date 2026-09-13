@@ -793,6 +793,32 @@ async function embedCurrentFlowImages(responseText, acceptedImages = new Map()) 
     return JSON.stringify(payload);
 }
 
+async function validateCurrentFlowImages(responseText, validator) {
+    let payload;
+    try {
+        payload = JSON.parse(String(responseText || ""));
+    } catch (error) {
+        throw new Error("Flow reference result validation received invalid JSON");
+    }
+    if (payload.flow2apiTransport !== "flow_google_ui" || !Array.isArray(payload.media)) {
+        return String(responseText || "");
+    }
+    for (const media of payload.media.slice(0, 16)) {
+        const generatedImage = media && media.image && media.image.generatedImage;
+        const identity = String(generatedImage && generatedImage.flow2apiIdentity || "");
+        const url = String(generatedImage && generatedImage.fifeUrl || "");
+        if (generatedImage) delete generatedImage.flow2apiIdentity;
+        const verdict = await validator.check({ identity, url });
+        if (verdict.status === "accepted") {
+            // One validated result matches the legacy response contract and keeps
+            // post-generation validation bounded even if Flow exposes many assets.
+            payload.media = [media];
+            return JSON.stringify(payload);
+        }
+    }
+    throw new Error("Flow reference result validation failed; no image was accepted");
+}
+
 async function handleGetSessionCookie(data, socket) {
     let authTabId = null;
     let closeAuthTab = false;
@@ -1001,8 +1027,6 @@ async function handleSubmitFlowRequest(data, socket) {
     let progressPollRunning = false;
     let lastProgressUpdatedAt = 0;
     let imageValidator = null;
-    let imageValidationRunning = false;
-    let imageValidationClosed = false;
     try {
         const targetUrl = new URL(String(data.url || ""));
         if (
@@ -1781,8 +1805,6 @@ async function handleSubmitFlowRequest(data, socket) {
                     let stablePolls = 0;
                     let imageFailurePolls = 0;
                     let confirmationClicked = false;
-                    window.__FLOW2API_IMAGE_CANDIDATES__ = null;
-                    window.__FLOW2API_IMAGE_VERDICT__ = null;
                     while (Date.now() < deadline) {
                         await pause(700);
                         if (!confirmationClicked) {
@@ -1804,20 +1826,6 @@ async function handleSubmitFlowRequest(data, socket) {
                             stablePolls = ids === stableIds ? stablePolls + 1 : 1;
                             stableIds = ids;
                             if (stablePolls >= 3) {
-                                let validatedImage = null;
-                                if (!isVideo) {
-                                    const verdict = window.__FLOW2API_IMAGE_VERDICT__;
-                                    if (verdict?.request_id === requestId) {
-                                        if (verdict.status === "error") throw new Error("Flow reference result validation failed; no image was accepted");
-                                        if (verdict.status === "reference") baselineIds.add(verdict.identity);
-                                        if (verdict.status === "accepted") validatedImage = fresh.find(asset => asset.identity === verdict.identity && asset.url === verdict.url);
-                                    }
-                                    window.__FLOW2API_IMAGE_CANDIDATES__ = {
-                                        request_id: requestId,
-                                        assets: fresh.filter(asset => !baselineIds.has(asset.identity)).slice(0, 16),
-                                    };
-                                    if (!validatedImage) continue;
-                                }
                                 reportProgress(isVideo ? "video_ready" : "image_ready");
                                 if (isVideo) {
                                     const asset = fresh[0];
@@ -1849,12 +1857,13 @@ async function handleSubmitFlowRequest(data, socket) {
                                 return {
                                     http_status: 200,
                                     response_text: JSON.stringify({
-                                        media: [validatedImage].map(asset => ({
+                                        media: fresh.slice(0, 16).map(asset => ({
                                             name: asset.mediaId || "",
                                             image: {
                                                 generatedImage: {
                                                     mediaId: asset.mediaId,
                                                     fifeUrl: asset.url,
+                                                    flow2apiIdentity: asset.identity,
                                                     prompt,
                                                     modelNameType: imageRequest.imageModelName || "",
                                                     aspectRatio: imageRequest.imageAspectRatio || "",
@@ -1871,7 +1880,6 @@ async function handleSubmitFlowRequest(data, socket) {
                         } else {
                             stableIds = "";
                             stablePolls = 0;
-                            if (!isVideo) window.__FLOW2API_IMAGE_CANDIDATES__ = null;
                         }
                         if (isVideo) {
                             const failure = newVideoFailure(videoFailureBaseline, readVideoFailures());
@@ -2046,8 +2054,6 @@ async function handleSubmitFlowRequest(data, socket) {
                                 return {
                                     phase: String(progress.phase || "active").slice(0, 64),
                                     updated_at: Number(progress.updated_at || 0),
-                                    imageCandidates: window.__FLOW2API_IMAGE_CANDIDATES__?.request_id === requestId
-                                        ? window.__FLOW2API_IMAGE_CANDIDATES__.assets : [],
                                 };
                             },
                             args: [String(data.req_id || "")],
@@ -2059,33 +2065,6 @@ async function handleSubmitFlowRequest(data, socket) {
                             const active = activeFlowSubmitBridges.get(newTabId);
                             if (active) active.lastPhase = progress.phase;
                             sendFlowSubmitProgress(data, socket, progress.phase);
-                        }
-                        if (imageValidator && !imageValidationRunning && !imageValidationClosed
-                            && Array.isArray(progress?.imageCandidates) && progress.imageCandidates.length) {
-                            imageValidationRunning = true;
-                            // Downloads/decoding can outlast the watchdog interval. Keep
-                            // progress polling independent of this bounded validation task.
-                            void (async () => {
-                                for (const candidate of progress.imageCandidates.slice(0, 16)) {
-                                    if (imageValidationClosed) return;
-                                    const verdict = await imageValidator.check(candidate);
-                                    if (imageValidationClosed) return;
-                                    await chrome.scripting.executeScript({
-                                        target: { tabId: newTabId },
-                                        world: "MAIN",
-                                        func: (requestId, value) => {
-                                            if (window.__FLOW2API_BROWSER_SUBMIT_PROGRESS__?.request_id === requestId) {
-                                                window.__FLOW2API_IMAGE_VERDICT__ = { request_id: requestId, ...value };
-                                            }
-                                        },
-                                        args: [String(data.req_id || ""), verdict],
-                                    });
-                                    if (verdict.status !== "reference") break;
-                                }
-                            })().catch(() => {
-                                // Navigation/teardown closes the request; the hard deadline
-                                // still bounds a live page that cannot receive the verdict.
-                            }).finally(() => { imageValidationRunning = false; });
                         }
                     } catch (error) {
                         // A navigation or destroyed execution context intentionally
@@ -2116,7 +2095,6 @@ async function handleSubmitFlowRequest(data, socket) {
             });
             results = await Promise.race([executionPromise, hardTimeoutPromise]);
         } finally {
-            imageValidationClosed = true;
             if (progressMonitor) clearInterval(progressMonitor);
             if (hardTimeoutHandle) clearTimeout(hardTimeoutHandle);
             if (!usesCurrentFlowUi) {
@@ -2149,6 +2127,9 @@ async function handleSubmitFlowRequest(data, socket) {
             }
         }
         if (result.http_status >= 200 && result.http_status < 300) {
+            if (imageValidator) {
+                responseText = await validateCurrentFlowImages(responseText, imageValidator);
+            }
             responseText = await embedCurrentFlowImages(responseText, imageValidator?.accepted);
         }
         sendSocketMessage({

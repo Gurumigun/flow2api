@@ -152,7 +152,7 @@ class ExtensionReconnectContractTests(unittest.TestCase):
 
         self.assertGreaterEqual(
             tuple(int(part) for part in manifest["version"].split(".")),
-            (1, 3, 27),
+            (1, 3, 28),
         )
         self.assertIn('data.type === "cancel_flow_request"', background)
         self.assertIn("cancelFlowSubmitRequest(data)", background)
@@ -172,6 +172,14 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn('button.getAttribute("aria-disabled") === "true"', background)
         self.assertIn('(disabled && /initiating image generation|이미지 생성 시작/.test(label))', background)
         self.assertIn('generationActive ? "generation_active" : "waiting_for_result"', background)
+
+    def test_image_result_validation_runs_after_the_page_script_returns(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn("validateCurrentFlowImages(responseText, imageValidator)", background)
+        self.assertIn("flow2apiIdentity: asset.identity", background)
+        self.assertNotIn("__FLOW2API_IMAGE_VERDICT__", background)
+        self.assertNotIn("__FLOW2API_IMAGE_CANDIDATES__", background)
 
     def test_user_action_tab_is_revealed_and_preserved(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
