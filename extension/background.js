@@ -865,7 +865,12 @@ async function validateCurrentFlowImages(responseText, validator) {
     if (payload.flow2apiTransport !== "flow_google_ui" || !Array.isArray(payload.media)) {
         return String(responseText || "");
     }
+    const baselineIdentities = Array.isArray(payload.flow2apiBaselineIdentities)
+        ? payload.flow2apiBaselineIdentities.map(value => String(value || "")).filter(Boolean)
+        : [];
+    delete payload.flow2apiBaselineIdentities;
     const verdicts = [];
+    const rejectedIdentities = [];
     for (const media of payload.media.slice(0, 16)) {
         const generatedImage = media && media.image && media.image.generatedImage;
         const identity = String(generatedImage && generatedImage.flow2apiIdentity || "");
@@ -873,6 +878,7 @@ async function validateCurrentFlowImages(responseText, validator) {
         if (generatedImage) delete generatedImage.flow2apiIdentity;
         const verdict = await validator.check({ identity, url });
         verdicts.push(verdict);
+        if (identity) rejectedIdentities.push(identity);
         if (verdict.status === "accepted") {
             // One validated result matches the legacy response contract and keeps
             // post-generation validation bounded even if Flow exposes many assets.
@@ -881,10 +887,144 @@ async function validateCurrentFlowImages(responseText, validator) {
         }
     }
     if (verdicts.some(verdict => verdict.status === "reference")) {
-        throw new Error("Flow result validation found only the uploaded reference image");
+        const error = new Error("Flow result validation found only the uploaded reference image");
+        error.flow2apiReferenceOnly = true;
+        error.flow2apiIgnoredIdentities = [...new Set([
+            ...baselineIdentities,
+            ...rejectedIdentities,
+        ])];
+        throw error;
     }
     const reason = verdicts.find(verdict => verdict.reason)?.reason || "no_candidate";
     throw new Error(`Flow result image could not be verified (${reason})`);
+}
+
+async function readCurrentFlowImageCandidates(tabId) {
+    const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: () => {
+            const assets = new Map();
+            const normalizedText = value => String(value || "").replace(/\s+/g, " ").trim();
+            const generationActive = Array.from(document.querySelectorAll("button"))
+                .filter(button => {
+                    const rect = button.getBoundingClientRect();
+                    const style = getComputedStyle(button);
+                    return rect.width > 0 && rect.height > 0
+                        && style.display !== "none" && style.visibility !== "hidden";
+                })
+                .some(button => {
+                    const label = normalizedText([
+                        button.getAttribute("aria-label"),
+                        button.getAttribute("title"),
+                        button.textContent,
+                    ].filter(Boolean).join(" ")).toLowerCase();
+                    const icons = Array.from(button.querySelectorAll("mat-icon, i"))
+                        .map(icon => normalizedText(icon.textContent).toLowerCase());
+                    return icons.includes("stop")
+                        || /generating (?:an )?image|이미지 생성 중|이미지를 생성 중/.test(label);
+                });
+            document.querySelectorAll("img").forEach(image => {
+                if (!image.complete || !image.naturalWidth
+                    || image.closest('flow-prompt-box, flow-add-menu-popover-content, [contenteditable="true"]')) return;
+                try {
+                    const parsed = new URL(String(image.currentSrc || image.src || ""), location.href);
+                    let mediaId = "";
+                    const isGoogleImageHost = (
+                        parsed.hostname === "flow.google.com"
+                        || parsed.hostname === "flow-content.google"
+                        || parsed.hostname === "lh3.google.com"
+                        || /(^|\.)googleusercontent\.com$/.test(parsed.hostname)
+                    );
+                    if (parsed.hostname === "flow-content.google") {
+                        const match = parsed.pathname.match(
+                            /^\/(?:image|video)\/([0-9a-f]{8}-[0-9a-f-]{27,})/i
+                        );
+                        mediaId = match ? match[1] : "";
+                    }
+                    if (!mediaId && isGoogleImageHost) {
+                        const candidate = parsed.searchParams.get("name") || "";
+                        if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(candidate)) mediaId = candidate;
+                    }
+                    const isCurrentFlowAsset = (
+                        parsed.hostname === "flow.google.com" && parsed.pathname.startsWith("/asb/")
+                    ) || (
+                        /(^|\.)googleusercontent\.com$/.test(parsed.hostname) && parsed.pathname.includes("/asb/")
+                    ) || (
+                        parsed.hostname === "lh3.google.com" && parsed.pathname.startsWith("/rd-asb/")
+                    );
+                    if (!mediaId && !isCurrentFlowAsset) return;
+                    const canonicalUrl = parsed.toString().replace(
+                        /=s\d+(?:-[a-z0-9-]+)?(?=$|[?#])/i,
+                        "",
+                    );
+                    const identity = mediaId ? `media:${mediaId}` : `url:${canonicalUrl}`;
+                    assets.set(identity, { identity, mediaId, url: parsed.toString() });
+                } catch (_) {
+                    // Ignore unrelated or malformed page images.
+                }
+            });
+            return { generationActive, assets: Array.from(assets.values()).slice(0, 32) };
+        },
+    });
+    const payload = results && results[0] && results[0].result;
+    return {
+        generationActive: Boolean(payload && payload.generationActive),
+        assets: Array.isArray(payload && payload.assets) ? payload.assets : [],
+    };
+}
+
+async function waitForValidatedFlowImage(tabId, responseText, validator, data, socket, ignoredValues) {
+    const original = JSON.parse(String(responseText || ""));
+    const template = original.media && original.media[0]
+        && original.media[0].image && original.media[0].image.generatedImage;
+    if (!template) throw new Error("Flow result validation cannot resume without image metadata");
+    const ignored = new Set((ignoredValues || []).map(value => String(value || "")).filter(Boolean));
+    const deadline = Date.now() + 120000;
+    let stableIds = "";
+    let stablePolls = 0;
+    while (Date.now() < deadline) {
+        if (cancelledFlowSubmitRequestIds.has(String(data.req_id || ""))) {
+            throw new Error("Flow browser submit cancelled");
+        }
+        const page = await readCurrentFlowImageCandidates(tabId);
+        sendFlowSubmitProgress(
+            data,
+            socket,
+            page.generationActive ? "generation_active" : "waiting_for_result",
+        );
+        const fresh = page.assets.filter(asset => !ignored.has(String(asset.identity || "")));
+        const ids = fresh.map(asset => String(asset.identity || "")).sort().join(",");
+        stablePolls = ids && ids === stableIds ? stablePolls + 1 : ids ? 1 : 0;
+        stableIds = ids;
+        if (stablePolls >= 3) {
+            for (const asset of fresh) {
+                const candidate = {
+                    media: [{
+                        name: asset.mediaId || "",
+                        image: {
+                            generatedImage: {
+                                ...template,
+                                mediaId: asset.mediaId || "",
+                                fifeUrl: asset.url,
+                                flow2apiIdentity: asset.identity,
+                            },
+                        },
+                    }],
+                    flow2apiTransport: "flow_google_ui",
+                };
+                const verdict = await validator.check(asset);
+                if (verdict.status === "accepted") {
+                    return validateCurrentFlowImages(JSON.stringify(candidate), validator);
+                }
+                if (verdict.status === "reference") ignored.add(String(asset.identity || ""));
+            }
+            stableIds = "";
+            stablePolls = 0;
+        }
+        await sleep(700);
+    }
+    throw new Error("Timed out waiting for a generated image after the uploaded reference image");
 }
 
 async function handleGetSessionCookie(data, socket) {
@@ -1954,6 +2094,7 @@ async function handleSubmitFlowRequest(data, socket) {
                                             },
                                         })),
                                         flow2apiTransport: "flow_google_ui",
+                                        flow2apiBaselineIdentities: Array.from(baselineIds),
                                     }),
                                     response_headers: { "content-type": "application/json" },
                                     fingerprint: browserFingerprint(),
@@ -2210,7 +2351,19 @@ async function handleSubmitFlowRequest(data, socket) {
         }
         if (result.http_status >= 200 && result.http_status < 300) {
             if (imageValidator) {
-                responseText = await validateCurrentFlowImages(responseText, imageValidator);
+                try {
+                    responseText = await validateCurrentFlowImages(responseText, imageValidator);
+                } catch (validationError) {
+                    if (!validationError.flow2apiReferenceOnly) throw validationError;
+                    responseText = await waitForValidatedFlowImage(
+                        newTabId,
+                        responseText,
+                        imageValidator,
+                        data,
+                        socket,
+                        validationError.flow2apiIgnoredIdentities,
+                    );
+                }
             }
             responseText = await embedCurrentFlowImages(responseText, imageValidator?.accepted);
         }
