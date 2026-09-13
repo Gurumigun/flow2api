@@ -157,6 +157,18 @@ def _normalize_utc_datetime(value: Any) -> Optional[datetime]:
     return value.astimezone(timezone.utc)
 
 
+def _parse_fresh_at_expiry(value: Any) -> datetime:
+    """Reject stale ST-to-AT responses before they can reactivate an account."""
+    expires_at = _normalize_utc_datetime(value)
+    if expires_at is None:
+        raise ValueError("ST-to-AT response did not include a valid access-token expiry")
+    if expires_at <= datetime.now(timezone.utc):
+        raise ValueError(
+            f"ST-to-AT returned an expired access token ({expires_at.isoformat()})"
+        )
+    return expires_at
+
+
 async def _annotate_token_runtime_status(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Add scheduler-facing availability and persisted CAPTCHA cooldown state."""
     extension_service = None
@@ -2548,14 +2560,7 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
         if not email:
             raise HTTPException(status_code=400, detail="Failed to get email from session token")
 
-        # Parse expiration time
-        from datetime import datetime
-        at_expires = None
-        if expires:
-            try:
-                at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
-            except:
-                pass
+        at_expires = _parse_fresh_at_expiry(expires)
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid session token: {str(e)}")
@@ -2579,11 +2584,24 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 proxy_url=request.get("proxy_url"),
                 auto_refresh_enabled=request.get("auto_refresh_enabled"),
                 refresh_interval_minutes=request.get("refresh_interval_minutes"),
+                # Plugin auto-enable has its own setting. Do not let the generic
+                # credential-edit behavior silently override that preference.
+                reactivate_on_credential_update=bool(plugin_config.auto_enable_on_update),
             )
 
-            # Check if auto-enable is enabled and token is disabled
-            if plugin_config.auto_enable_on_update and not existing_token.is_active:
-                await token_manager.enable_token(existing_token.id)
+            # A browser-disabled account is still unavailable in extension mode,
+            # even if its generic activity flag was restored by the credential
+            # update. Restore both halves of the operator-facing switch.
+            if plugin_config.auto_enable_on_update and (
+                not existing_token.is_active or not existing_token.browser_enabled
+            ):
+                await token_manager.set_browser_connection_enabled(existing_token.id, True)
+                # These credentials came from the updater and were validated
+                # above, so no second browser-session synchronization is needed.
+                await db.update_token(
+                    existing_token.id,
+                    browser_session_sync_pending=False,
+                )
                 return {
                     "success": True,
                     "message": f"Token updated and auto-enabled for {email}",

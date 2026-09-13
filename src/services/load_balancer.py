@@ -459,7 +459,35 @@ class LoadBalancer:
         """给出更明确的“无可用账号”原因，优先用于分辨率/tier 档位提示。"""
         active_tokens = await self.token_manager.get_active_tokens()
         if not active_tokens:
-            return None
+            all_tokens = await self.token_manager.get_all_tokens()
+            if not all_tokens:
+                return "没有可用的Token：系统中尚未配置Token。"
+
+            browser_paused = sum(
+                1 for token in all_tokens if not bool(getattr(token, "browser_enabled", True))
+            )
+            now = datetime.now(timezone.utc)
+            expired = sum(
+                1
+                for token in all_tokens
+                if (
+                    not str(getattr(token, "at", "") or "").strip()
+                    or (
+                        self._as_utc(getattr(token, "at_expires", None)) is not None
+                        and self._as_utc(getattr(token, "at_expires", None)) <= now
+                    )
+                )
+            )
+            details = []
+            if browser_paused:
+                details.append(f"浏览器连接已关闭 {browser_paused} 个")
+            if expired:
+                details.append(f"AT缺失或已过期 {expired} 个")
+            detail_text = f"（{', '.join(details)}）" if details else ""
+            return (
+                f"没有可用的Token：共 {len(all_tokens)} 个Token，全部处于停用状态"
+                f"{detail_text}。请在管理页面启用浏览器连接并刷新登录凭证。"
+            )
 
         required_tier = get_required_paygate_tier_for_model(model)
         supported_tokens = []

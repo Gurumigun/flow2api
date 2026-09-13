@@ -700,6 +700,7 @@ class TokenManager:
         proxy_url: Optional[str] = None,
         auto_refresh_enabled: Optional[bool] = None,
         refresh_interval_minutes: Optional[int] = None,
+        reactivate_on_credential_update: bool = True,
     ):
         """Update token (支持修改project_id和project_name)
 
@@ -758,7 +759,12 @@ class TokenManager:
         )
         if browser_state_changed:
             update_fields["browser_session_sync_pending"] = True
-        if credential_updated and token and not token.is_active:
+        if (
+            reactivate_on_credential_update
+            and credential_updated
+            and token
+            and not token.is_active
+        ):
             debug_logger.log_info(f"[UPDATE_TOKEN] Token {token_id} 已更新凭证，自动恢复为启用状态")
             update_fields["is_active"] = True
             update_fields["ban_reason"] = None
