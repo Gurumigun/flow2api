@@ -17,11 +17,18 @@ const document = {
 };
 const normalizedText = value => String(value || '').replace(/\s+/g, ' ').trim();
 const isVisible = node => !node.hidden;
-const button = ({ text = '', ariaLabel = '', title = '', icons = [], hidden = false } = {}) => ({
+const button = ({ text = '', ariaLabel = '', title = '', icons = [], hidden = false, disabled = false } = {}) => ({
   hidden,
+  disabled,
   textContent: text,
   getAttribute(name) {
-    return name === 'aria-label' ? ariaLabel : name === 'title' ? title : null;
+    return name === 'aria-label'
+      ? ariaLabel
+      : name === 'title'
+        ? title
+        : name === 'aria-disabled' && disabled
+          ? 'true'
+          : null;
   },
   querySelectorAll(selector) {
     assert.equal(selector, 'mat-icon, i');
@@ -42,8 +49,13 @@ test('visible Flow stop control keeps image generation active', () => {
 });
 
 test('visible initiating label keeps image generation active', () => {
-  page.buttons = [button({ text: 'Initiating Image Generation arrow_forward_ios' })];
+  page.buttons = [button({ text: 'Initiating Image Generation arrow_forward_ios', disabled: true })];
   assert.equal(imageGenerationIsActive(), true);
+});
+
+test('an enabled historical initiating label is not treated as active generation', () => {
+  page.buttons = [button({ text: 'Initiating Image Generation arrow_forward_ios' })];
+  assert.equal(imageGenerationIsActive(), false);
 });
 
 test('hidden controls do not keep image generation active', () => {

@@ -14,5 +14,7 @@ class ImageResultVersionTests(unittest.TestCase):
         for version in ('1.3.30', '1.4.0', '2.0.0'):
             ExtensionCaptchaService._require_image_ui_version(version)
 
-    def test_video_worker_requirement_is_unchanged(self):
-        ExtensionCaptchaService._require_video_ui_version('1.3.21')
+    def test_video_worker_requires_current_original_download_support(self):
+        with self.assertRaises(ExtensionCaptchaError):
+            ExtensionCaptchaService._require_video_ui_version('1.3.30')
+        ExtensionCaptchaService._require_video_ui_version('1.3.31')

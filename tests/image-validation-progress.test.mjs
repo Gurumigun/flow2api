@@ -6,38 +6,34 @@ const source = readFileSync(new URL('../extension/background.js', import.meta.ur
 const start = source.indexOf('const pollProgress = async () =>');
 const body = source.slice(start, source.indexOf('progressMonitor = setInterval', start));
 
-test('a slow image validator cannot block progress heartbeats or start duplicate validation', async () => {
+test('a slow page progress probe cannot block extension heartbeats or start a duplicate probe', async () => {
   let release;
-  let checks = 0;
-  const verdictReady = new Promise(resolve => {release=resolve;});
+  let probes = 0;
+  const snapshotReady = new Promise(resolve => {release=resolve;});
   const events = [];
-  const writes = [];
-  const imageValidator = {check:async candidate => {checks++; await verdictReady; return {...candidate,status:'accepted'};}};
   const chrome = {scripting:{executeScript:async request => {
-    if (request.args.length === 2) {writes.push(request.args[1]); return [];}
-    return [{result:{phase:'generating',updated_at:Date.now()+events.length,imageCandidates:[{identity:'body',url:'https://flow.google.com/asb/body'}]}}];
+    probes++;
+    await snapshotReady;
+    return [{result:{phase:'generating',updated_at:Date.now()+events.length}}];
   }}};
-  const create = new Function('chrome','imageValidator','sendFlowSubmitProgress','sendActiveFlowSubmitHeartbeat','activeFlowSubmitBridges', `
-    let newTabId=1, progressPollRunning=false, imageValidationRunning=false, imageValidationClosed=false, lastProgressUpdatedAt=0;
+  const create = new Function('chrome','sendFlowSubmitProgress','sendActiveFlowSubmitHeartbeat','activeFlowSubmitBridges', `
+    let newTabId=1, progressPollRunning=false, lastProgressUpdatedAt=0;
     const data={req_id:'request-1'}, socket={};
     ${body}
-    return {pollProgress, close:()=>{imageValidationClosed=true;}, running:()=>imageValidationRunning};
+    return {pollProgress};
   `);
   const runner = create(
     chrome,
-    imageValidator,
     (_data,_socket,phase)=>events.push(phase),
     ()=>events.push('extension_active'),
     new Map([[1, {lastPhase:'generating'}]]),
   );
-  await Promise.race([runner.pollProgress(), new Promise((_,reject)=>setTimeout(()=>reject(new Error('Heartbeat waited for image validation')),100))]);
+  const firstPoll = runner.pollProgress();
   await runner.pollProgress();
-  assert.deepEqual(events, ['extension_active','generating','extension_active','generating']);
-  assert.equal(checks,1);
-  assert(runner.running());
-  runner.close();
+  assert.deepEqual(events, ['extension_active', 'extension_active']);
+  assert.equal(probes, 1);
+
   release();
-  await new Promise(resolve=>setTimeout(resolve,0));
-  assert.equal(writes.length,0,'a closed request cannot publish a late verdict');
-  assert(!runner.running());
+  await firstPoll;
+  assert.deepEqual(events, ['extension_active', 'extension_active', 'generating']);
 });
