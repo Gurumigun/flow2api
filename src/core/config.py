@@ -508,6 +508,90 @@ class Config:
             return 3.0
 
     @property
+    def extension_route_queue_timeout_seconds(self) -> float:
+        """扩展路由繁忙时允许单个请求排队的最长时间。"""
+        value = self._config.get("captcha", {}).get("extension_route_queue_timeout_seconds", 5.0)
+        try:
+            return max(0.01, min(300.0, float(value)))
+        except Exception:
+            return 5.0
+
+    @property
+    def extension_transport_generation_retries(self) -> int:
+        """扩展浏览器传输异常时单次生成允许的总尝试次数。"""
+        value = self._config.get("captcha", {}).get("extension_transport_generation_retries", 4)
+        try:
+            return max(1, min(6, int(value)))
+        except Exception:
+            return 4
+
+    @property
+    def extension_image_transport_generation_retries(self) -> int:
+        """图片 UI 传输的总账号尝试次数；默认限制为两个以适配客户端超时。"""
+        captcha = self._config.get("captcha", {})
+        value = captcha.get("extension_image_transport_generation_retries")
+        if value is None:
+            value = captcha.get("extension_transport_generation_retries", 2)
+        try:
+            return max(1, min(6, int(value)))
+        except Exception:
+            return 2
+
+    @property
+    def extension_progress_stall_timeout_seconds(self) -> float:
+        """扩展未报告页面进度多久后判定当前 Flow 标签页卡死。"""
+        value = self._config.get("captcha", {}).get("extension_progress_stall_timeout_seconds", 30.0)
+        try:
+            return max(0.05, min(120.0, float(value)))
+        except Exception:
+            return 30.0
+
+    @property
+    def extension_image_phase_timeout_seconds(self) -> float:
+        """图片请求停留在同一 Flow 页面阶段多久后切换浏览器账号。"""
+        value = self._config.get("captcha", {}).get(
+            "extension_image_phase_timeout_seconds",
+            150.0,
+        )
+        try:
+            return max(30.0, min(240.0, float(value)))
+        except Exception:
+            return 150.0
+
+    @property
+    def extension_image_result_timeout_seconds(self) -> float:
+        """生成按钮停止后等待新图片出现在 Flow 页面上的最长时间。"""
+        value = self._config.get("captcha", {}).get(
+            "extension_image_result_timeout_seconds",
+            120.0,
+        )
+        try:
+            return max(5.0, min(120.0, float(value)))
+        except Exception:
+            return 120.0
+
+    @property
+    def extension_image_total_timeout_seconds(self) -> float:
+        """扩展图片生成与账号切换的总时间预算，需低于常见 300 秒网关限制。"""
+        value = self._config.get("captcha", {}).get(
+            "extension_image_total_timeout_seconds",
+            270.0,
+        )
+        try:
+            return max(60.0, min(285.0, float(value)))
+        except Exception:
+            return 270.0
+
+    @property
+    def extension_stall_cooldown_seconds(self) -> int:
+        """卡死的扩展账号在重新参与图片调度前的冷却时间。"""
+        value = self._config.get("captcha", {}).get("extension_stall_cooldown_seconds", 120)
+        try:
+            return max(30, min(1800, int(value)))
+        except Exception:
+            return 120
+
+    @property
     def extension_global_min_interval_seconds(self) -> float:
         """所有扩展路由之间的最小发车间隔，用于平滑同一出口 IP 的突发。"""
         value = self._config.get("captcha", {}).get("extension_global_min_interval_seconds", 1.0)

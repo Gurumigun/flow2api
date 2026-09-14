@@ -141,6 +141,74 @@ class TokenManager:
     async def _get_credits_for_token(self, token: Token, at: str) -> Dict[str, Any]:
         return await self._flow_call_for_token(token, lambda: self.flow_client.get_credits(at))
 
+    async def _adopt_extension_browser_project(
+        self,
+        token_id: int,
+        token: Token,
+        project_id: str,
+    ) -> None:
+        """Persist a project already open in the mapped Flow browser profile."""
+        normalized_project_id = str(project_id or "").strip()
+        if (
+            not 8 <= len(normalized_project_id) <= 128
+            or any(
+                not (character.isalnum() or character in "_-")
+                for character in normalized_project_id
+            )
+        ):
+            return
+
+        try:
+            project = await self.db.get_project_by_id(normalized_project_id)
+            if project is not None and project.token_id != token_id:
+                debug_logger.log_warning(
+                    f"[BROWSER_SYNC] Token {token_id}: observed Flow project is mapped to another token"
+                )
+                return
+
+            current_project_id = str(token.current_project_id or "").strip()
+            if current_project_id:
+                current_project = await self.db.get_project_by_id(current_project_id)
+                if (
+                    current_project is not None
+                    and current_project.token_id == token_id
+                    and current_project.is_active
+                ):
+                    return
+
+            if project is not None and not project.is_active:
+                await self.db.delete_project(normalized_project_id)
+                project = None
+
+            project_name = (
+                str(getattr(project, "project_name", "") or "").strip()
+                or "Flow browser project P1"
+            )
+            if project is None:
+                project = Project(
+                    project_id=normalized_project_id,
+                    token_id=token_id,
+                    project_name=project_name,
+                )
+                project.id = await self.db.add_project(project)
+
+            await self.db.update_token(
+                token_id,
+                current_project_id=normalized_project_id,
+                current_project_name=project_name,
+            )
+            token.current_project_id = normalized_project_id
+            token.current_project_name = project_name
+            debug_logger.log_info(
+                f"[BROWSER_SYNC] Token {token_id}: adopted the currently open Flow project"
+            )
+        except Exception as e:
+            # Authentication is still useful even if a concurrent sync already
+            # inserted the same project mapping.
+            debug_logger.log_warning(
+                f"[BROWSER_SYNC] Token {token_id}: could not adopt browser project - {e}"
+            )
+
     async def _refresh_at_from_extension_browser(self, token_id: int, token: Token) -> bool:
         """Verify and adopt the current mapped Flow browser authentication."""
         from .browser_captcha_extension import ExtensionCaptchaService
@@ -170,6 +238,7 @@ class TokenManager:
             browser_auth_status = 0
         browser_auth_error = str(credentials.get("browser_auth_error") or "").strip()[:240]
         observed_api_key = bool(credentials.get("observed_api_key"))
+        browser_project_id = str(credentials.get("project_id") or "").strip()
         captured_token_rejected = False
         now = datetime.now(timezone.utc)
 
@@ -193,6 +262,11 @@ class TokenManager:
                 )
                 token.at = browser_at
                 token.at_expires = expires_at
+                await self._adopt_extension_browser_project(
+                    token_id,
+                    token,
+                    browser_project_id,
+                )
                 self._mark_at_valid(token_id)
                 record_token_refresh("at", "success")
                 debug_logger.log_info(
@@ -220,6 +294,11 @@ class TokenManager:
                 update_values["user_paygate_tier"] = credentials.get("user_paygate_tier")
             await self.db.update_token(token_id, **update_values)
             token.at_expires = expires_at
+            await self._adopt_extension_browser_project(
+                token_id,
+                token,
+                browser_project_id,
+            )
             self._mark_at_valid(
                 token_id,
                 ttl_seconds=max(300, int(self._BROWSER_COOKIE_AUTH_VALIDITY.total_seconds()) - 60),
@@ -1394,6 +1473,31 @@ class TokenManager:
         except Exception as e:
             debug_logger.log_warning(f"[PROTOCOL_REFRESH] 停止后台任务时出错: {e}")
 
+    async def reset_project_pool(self, token_id: int) -> int:
+        """Forget stale local project mappings so the pool can be recreated."""
+        project_lock = await self._get_token_lock(
+            self._project_locks,
+            self._project_lock_guard,
+            token_id,
+        )
+        async with project_lock:
+            token = await self.db.get_token(token_id)
+            if not token:
+                raise ValueError("Token not found")
+
+            projects = await self.db.get_projects_by_token(token_id)
+            for project in projects:
+                await self.db.delete_project(project.project_id)
+            await self.db.update_token(
+                token_id,
+                current_project_id=None,
+                current_project_name=None,
+            )
+            debug_logger.log_warning(
+                f"[PROJECT] Reset {len(projects)} stale project mapping(s) for token {token_id}"
+            )
+            return len(projects)
+
     async def ensure_project_exists(self, token_id: int) -> str:
         """Ensure a token has a pooled set of projects and return one in round-robin order."""
         project_lock = await self._get_token_lock(
@@ -1412,7 +1516,34 @@ class TokenManager:
             try:
                 project_pool_size = self._get_project_pool_size()
                 while len(projects) < project_pool_size:
-                    new_project = await self._create_project_for_token(token, len(projects) + 1)
+                    try:
+                        new_project = await self._create_project_for_token(token, len(projects) + 1)
+                    except Exception as create_error:
+                        if config.captcha_method == "extension":
+                            if not projects:
+                                # A stale legacy session may be unable to create
+                                # projects even while the mapped Flow tab remains
+                                # authenticated. Force one browser sync so its
+                                # open project can be adopted for this request.
+                                await self.db.update_token(
+                                    token_id,
+                                    browser_session_sync_pending=True,
+                                )
+                                if await self.sync_extension_browser_session(token_id):
+                                    token = await self.db.get_token(token_id) or token
+                                    projects = [
+                                        project
+                                        for project in await self.db.get_projects_by_token(token_id)
+                                        if project.is_active
+                                    ]
+                                    projects = self._sort_projects(projects)
+                            if projects:
+                                debug_logger.log_warning(
+                                    f"[PROJECT] Token {token_id}: could not top up the project pool; "
+                                    f"using {len(projects)} browser-observed project(s) - {create_error}"
+                                )
+                                break
+                        raise
                     projects.append(new_project)
                     projects = self._sort_projects(projects)
 

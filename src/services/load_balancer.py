@@ -1,6 +1,7 @@
 """Load balancing module for Flow2API"""
 import asyncio
 import random
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 from ..core.models import Token
@@ -28,6 +29,8 @@ class LoadBalancer:
         self._round_robin_state: Dict[str, Optional[int]] = {"image": None, "video": None, "default": None}
         self._rr_lock = asyncio.Lock()
         self._captcha_circuit_lock = asyncio.Lock()
+        self._extension_transport_cooldown_until: Dict[int, float] = {}
+        self._extension_transport_cooldown_lock = asyncio.Lock()
 
     @staticmethod
     def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
@@ -161,6 +164,27 @@ class LoadBalancer:
                 return max(0, int(self._video_pending.get(token_id, 0)))
             return 0
 
+    async def get_extension_transport_cooldown_remaining(self, token_id: int) -> float:
+        async with self._extension_transport_cooldown_lock:
+            deadline = float(self._extension_transport_cooldown_until.get(token_id, 0.0))
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                self._extension_transport_cooldown_until.pop(token_id, None)
+            return remaining
+
+    async def record_extension_transport_failure(self, token_id: int) -> float:
+        cooldown = float(config.extension_stall_cooldown_seconds)
+        async with self._extension_transport_cooldown_lock:
+            self._extension_transport_cooldown_until[token_id] = time.monotonic() + cooldown
+        debug_logger.log_warning(
+            f"[LOAD_BALANCER] Token {token_id} extension route cooling for {cooldown:.0f}s"
+        )
+        return cooldown
+
+    async def record_extension_transport_success(self, token_id: int) -> None:
+        async with self._extension_transport_cooldown_lock:
+            self._extension_transport_cooldown_until.pop(token_id, None)
+
     async def _add_pending(self, token_id: int, for_image_generation: bool, for_video_generation: bool):
         async with self._pending_lock:
             if for_image_generation:
@@ -244,7 +268,13 @@ class LoadBalancer:
             self._round_robin_state[scenario] = selected["token"].id
         return selected
 
-    async def _check_extension_route(self, token: Token) -> tuple[bool, str]:
+    async def _check_extension_route(
+        self,
+        token: Token,
+        *,
+        require_image_ui: bool = False,
+        require_video_ui: bool = False,
+    ) -> tuple[bool, str]:
         """Ensure extension captcha requests are routed to the selected account."""
         if config.captcha_method != "extension":
             return True, ""
@@ -255,6 +285,15 @@ class LoadBalancer:
             service = await ExtensionCaptchaService.get_instance(getattr(self.token_manager, "db", None))
             has_connection, route_key = await service.has_connection_for_token(token.id)
             if has_connection:
+                routes = service.get_runtime_status()["routes"]
+                route = next((item for item in routes if item["route_key"] == route_key), {})
+                flow_ui_error = route.get("flow_ui_error") or route.get("video_ui_error")
+                if flow_ui_error:
+                    return False, flow_ui_error
+                if require_image_ui:
+                    service._require_image_ui_version(route.get("extension_version", ""))
+                if require_video_ui:
+                    service._require_video_ui_version(route.get("extension_version", ""))
                 return True, ""
 
             available = service.describe_routes() or "none"
@@ -272,6 +311,7 @@ class LoadBalancer:
         reserve: bool = False,
         enforce_concurrency_filter: bool = True,
         track_pending: bool = False,
+        exclude_token_ids: Optional[set[int]] = None,
     ) -> Optional[Token]:
         """
         Select a token using load-aware balancing
@@ -307,8 +347,12 @@ class LoadBalancer:
         available_tokens = []
         filtered_reasons = {}
         required_tier = get_required_paygate_tier_for_model(model)
+        excluded_ids = {int(item) for item in (exclude_token_ids or set())}
 
         for token in active_tokens:
+            if token.id in excluded_ids:
+                filtered_reasons[token.id] = "当前请求已尝试过该账号"
+                continue
             if config.captcha_method == "extension" and not token.browser_enabled:
                 filtered_reasons[token.id] = "브라우저 사용이 수동으로 꺼져 있음"
                 continue
@@ -326,7 +370,15 @@ class LoadBalancer:
                     filtered_reasons[token.id] = "图片生成已禁用"
                     continue
 
-                route_ok, route_reason = await self._check_extension_route(token)
+                transport_cooldown = await self.get_extension_transport_cooldown_remaining(token.id)
+                if transport_cooldown > 0:
+                    filtered_reasons[token.id] = f"扩展传输冷却中 ({transport_cooldown:.0f}秒)"
+                    continue
+
+                route_ok, route_reason = await self._check_extension_route(
+                    token,
+                    require_image_ui=True,
+                )
                 if not route_ok:
                     filtered_reasons[token.id] = route_reason
                     continue
@@ -344,7 +396,9 @@ class LoadBalancer:
                     filtered_reasons[token.id] = "视频生成已禁用"
                     continue
 
-                route_ok, route_reason = await self._check_extension_route(token)
+                route_ok, route_reason = await self._check_extension_route(
+                    token, require_video_ui=bool(model and ("_t2v_" in model or "_i2v_s_" in model)),
+                )
                 if not route_ok:
                     filtered_reasons[token.id] = route_reason
                     continue

@@ -5,6 +5,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from src.core.config import config
 from src.core.database import Database
@@ -127,6 +128,47 @@ class _ImmediateExtensionSocket:
 
     async def close(self, code=1000):
         self.closed_codes.append(code)
+
+
+class _ProgressExtensionSocket(_ImmediateExtensionSocket):
+    def __init__(self, service, *, send_progress=True):
+        super().__init__(service)
+        self.send_progress = send_progress
+        self.cancelled_flow_requests = []
+
+    async def send_text(self, data):
+        payload = json.loads(data)
+        if payload.get("type") == "cancel_flow_request":
+            self.cancelled_flow_requests.append(payload["req_id"])
+            return
+        if payload.get("type") != "submit_flow_request":
+            await super().send_text(data)
+            return
+
+        async def deliver():
+            if self.send_progress:
+                await asyncio.sleep(0.03)
+                await self.service.handle_message(
+                    self,
+                    json.dumps({
+                        "type": "flow_submit_progress",
+                        "req_id": payload["req_id"],
+                        "phase": "generating",
+                    }),
+                )
+                await asyncio.sleep(0.03)
+                await self.service.handle_message(
+                    self,
+                    json.dumps({
+                        "type": "flow_submit_result",
+                        "req_id": payload["req_id"],
+                        "status": "success",
+                        "http_status": 200,
+                        "response_text": '{"media":[]}',
+                    }),
+                )
+
+        asyncio.create_task(deliver())
 
 
 class _ConnectExtensionSocket(_ImmediateExtensionSocket):
@@ -294,6 +336,8 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         self.captcha_config = config._config.setdefault("captcha", {})
         self.original = dict(self.captcha_config)
         self.captcha_config["extension_route_min_interval_seconds"] = 0.05
+        self.captcha_config["extension_route_queue_timeout_seconds"] = 0.02
+        self.captcha_config["extension_progress_stall_timeout_seconds"] = 0.05
         self.captcha_config["extension_global_min_interval_seconds"] = 0.0
         self.captcha_config["captcha_method"] = "extension"
 
@@ -335,9 +379,149 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session_token, "labs-session-token")
 
-    async def test_current_flow_access_token_can_be_read_for_mapped_profile(self):
+    async def test_session_refresh_does_not_wait_for_image_route(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())
         websocket = _ImmediateExtensionSocket(service)
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.12",
+            )
+        )
+        generation_lock = service._route_locks.setdefault("google-1", asyncio.Lock())
+        await generation_lock.acquire()
+        try:
+            credentials = await asyncio.wait_for(
+                service.get_browser_credentials(token_id=1, project_id="project-a"),
+                timeout=0.1,
+            )
+        finally:
+            generation_lock.release()
+
+        self.assertTrue(credentials["access_token"].startswith("opaque-flow-token_"))
+
+    async def test_busy_image_route_fails_after_bounded_queue_wait(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service)
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.30",
+            )
+        )
+        generation_lock = service._route_locks.setdefault("google-1", asyncio.Lock())
+        await generation_lock.acquire()
+        try:
+            with self.assertRaises(ExtensionCaptchaError) as raised:
+                await service.submit_flow_request(
+                    project_id="project-a",
+                    action="IMAGE_GENERATION",
+                    token_id=1,
+                    url=(
+                        "https://aisandbox-pa.googleapis.com/v1/projects/project-a/"
+                        "flowMedia:batchGenerateImages"
+                    ),
+                    at_token="access-token",
+                    json_data={},
+                    timeout=15,
+                )
+        finally:
+            generation_lock.release()
+
+        self.assertEqual(raised.exception.code, "extension_route_busy")
+
+    async def test_flow_progress_keeps_a_slow_submit_alive(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ProgressExtensionSocket(service, send_progress=True)
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.30",
+            )
+        )
+
+        response = await service.submit_flow_request(
+            project_id="project-a",
+            action="IMAGE_GENERATION",
+            token_id=1,
+            url=(
+                "https://aisandbox-pa.googleapis.com/v1/projects/project-a/"
+                "flowMedia:batchGenerateImages"
+            ),
+            at_token="access-token",
+            json_data={},
+            timeout=15,
+        )
+
+        self.assertEqual(response["status"], 200)
+
+    async def test_missing_flow_progress_fails_fast(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ProgressExtensionSocket(service, send_progress=False)
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.30",
+            )
+        )
+
+        with self.assertRaises(ExtensionCaptchaError) as raised:
+            await service.submit_flow_request(
+                project_id="project-a",
+                action="IMAGE_GENERATION",
+                token_id=1,
+                url=(
+                    "https://aisandbox-pa.googleapis.com/v1/projects/project-a/"
+                    "flowMedia:batchGenerateImages"
+                ),
+                at_token="access-token",
+                json_data={},
+                timeout=15,
+            )
+
+        self.assertEqual(raised.exception.code, "extension_flow_stalled")
+
+    async def test_stalled_flow_submit_cancels_supported_extension_work(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ProgressExtensionSocket(service, send_progress=False)
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.30",
+            )
+        )
+
+        with self.assertRaises(ExtensionCaptchaError) as raised:
+            await service.submit_flow_request(
+                project_id="project-a",
+                action="IMAGE_GENERATION",
+                token_id=1,
+                url=(
+                    "https://aisandbox-pa.googleapis.com/v1/projects/project-a/"
+                    "flowMedia:batchGenerateImages"
+                ),
+                at_token="access-token",
+                json_data={},
+                timeout=15,
+            )
+
+        self.assertEqual(raised.exception.code, "extension_flow_stalled")
+        self.assertEqual(len(websocket.cancelled_flow_requests), 1)
+
+    async def test_current_flow_access_token_can_be_read_for_mapped_profile(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service, credential_result={
+            "status": "success",
+            "session_token": "labs-session-token",
+            "access_token": "opaque-flow-token_" + ("captured" * 8),
+            "access_token_captured_at": 123456789,
+            "project_id": "observed-project-123",
+        })
         service.active_connections.append(
             ExtensionConnection(
                 websocket=websocket,
@@ -354,6 +538,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(credentials["access_token"].startswith("opaque-flow-token_"))
         self.assertEqual(credentials["session_token"], "labs-session-token")
         self.assertEqual(credentials["extension_version"], "1.3.0")
+        self.assertEqual(credentials["project_id"], "observed-project-123")
 
     async def test_current_sid_probe_400_counts_as_authenticated(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())
@@ -407,7 +592,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.11",
+                extension_version="1.3.30",
             )
         )
 
@@ -438,7 +623,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.11",
+                extension_version="1.3.30",
             )
         )
 
@@ -472,10 +657,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
                 project_id="project-a",
                 action="UPLOAD_IMAGE",
                 token_id=1,
-                url=(
-                    "https://aisandbox-pa.googleapis.com/v1/projects/project-a/"
-                    "flowMedia:batchGenerateImages"
-                ),
+                url="https://aisandbox-pa.googleapis.com/v1/flow/uploadImage",
                 at_token="",
                 json_data={"clientContext": {"projectId": "project-a"}},
                 timeout=15,
@@ -488,7 +670,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(websocket=websocket, route_key="google-1")
         )
 
-        with self.assertRaisesRegex(RuntimeError, "must be reloaded"):
+        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.30"):
             await service.submit_flow_request(
                 project_id="project-a",
                 action="IMAGE_GENERATION",
@@ -502,7 +684,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
                 timeout=15,
             )
 
-    async def test_current_flow_image_submit_requires_version_1_3_11(self):
+    async def test_current_flow_image_submit_requires_version_1_3_30(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())
         websocket = _ImmediateExtensionSocket(service)
         service.active_connections.append(
@@ -513,7 +695,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with self.assertRaisesRegex(ExtensionCaptchaError, "required: 1.3.11") as raised:
+        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.30") as raised:
             await service.submit_flow_request(
                 project_id="project-a",
                 action="IMAGE_GENERATION",
@@ -618,12 +800,30 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(selected.id, 2)
 
+    async def test_load_balancer_temporarily_skips_stalled_extension_route(self):
+        first = Token(id=1, st="st-1", at="at-1", email="first@example.com")
+        second = Token(id=2, st="st-2", at="at-2", email="second@example.com")
+        balancer = LoadBalancer(_TokenManagerStub([first, second]))
+        balancer._check_extension_route = AsyncMock(return_value=(True, ""))
+
+        remaining = await balancer.record_extension_transport_failure(first.id)
+        selected = await balancer.select_token(for_image_generation=True)
+
+        self.assertGreaterEqual(remaining, 29)
+        self.assertEqual(selected.id, second.id)
+        await balancer.record_extension_transport_success(first.id)
+        self.assertEqual(
+            await balancer.get_extension_transport_cooldown_remaining(first.id),
+            0,
+        )
+
 
 class RecaptchaRetryBudgetTests(unittest.TestCase):
     def setUp(self):
         self.captcha_config = config._config.setdefault("captcha", {})
         self.original = dict(self.captcha_config)
         self.captcha_config["browser_captcha_generation_retries"] = 1
+        self.captcha_config["extension_transport_generation_retries"] = 2
 
     def tearDown(self):
         self.captcha_config.clear()
@@ -634,6 +834,26 @@ class RecaptchaRetryBudgetTests(unittest.TestCase):
         resolved = client._resolve_generation_retry_budget(
             5,
             "PUBLIC_ERROR_UNUSUAL_ACTIVITY: reCAPTCHA evaluation failed",
+        )
+        self.assertEqual(resolved, 1)
+
+    def test_extension_transport_failure_gets_only_one_recovery_retry(self):
+        client = FlowClient(proxy_manager=None)
+
+        self.assertEqual(client._resolve_generation_retry_budget(
+            5,
+            "Flow browser submit returned no HTTP response",
+        ), 2)
+        self.assertEqual(client._resolve_generation_retry_budget(
+            5,
+            "Chrome extension Flow submit timed out",
+        ), 2)
+
+    def test_busy_extension_route_is_not_retried_on_same_account(self):
+        client = FlowClient(proxy_manager=None)
+        resolved = client._resolve_generation_retry_budget(
+            5,
+            "Chrome extension route 'google-1' remained busy for 30.0s",
         )
         self.assertEqual(resolved, 1)
 

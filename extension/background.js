@@ -1,10 +1,15 @@
+importScripts("video-ui-download.js");
+
 let ws = null;
 let connectPromise = null;
 let connectionGeneration = 0;
 let reconnectTimeout = null;
 let heartbeatInterval = null;
 let routeEnabled = true;
-let ignoreFlowAuthorizationCaptureUntil = 0;
+const ignoredFlowAuthorizationTabIds = new Set();
+const activeFlowSubmitBridges = new Map();
+const cancelledFlowSubmitRequestIds = new Set();
+const queuedFlowSubmitMonitors = new Map();
 
 const RECONNECT_ALARM_NAME = "flow2api-reconnect";
 const RECONNECT_ALARM_PERIOD_MINUTES = 0.5;
@@ -18,6 +23,8 @@ const FLOW_REQUEST_AUTH_STORAGE_KEY = "flowRequestAuthObservation";
 const FLOW_ACCESS_TOKEN_MAX_AGE_MS = 2 * 60 * 1000;
 const FLOW_REQUEST_AUTH_MAX_AGE_MS = 5 * 60 * 1000;
 const FLOW_API_ROOT_URL = "https://aisandbox-pa.googleapis.com/v1";
+const FLOW_PROGRESS_POLL_INTERVAL_MS = 5000;
+const FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS = 30000;
 
 const DEFAULT_SETTINGS = {
     serverUrl: "ws://127.0.0.1:8000/captcha_ws",
@@ -340,6 +347,38 @@ function buildFlowPageUrl(projectId = "") {
         : FLOW_ROOT_URL;
 }
 
+function flowProjectIdFromUrl(rawUrl) {
+    try {
+        const parsed = new URL(String(rawUrl || ""));
+        if (parsed.origin !== FLOW_ROOT_URL) return "";
+        const match = parsed.pathname.match(/(?:^|\/)project\/([^/?#]+)/);
+        const projectId = match ? decodeURIComponent(match[1]) : "";
+        return /^[A-Za-z0-9_-]{8,128}$/.test(projectId) ? projectId : "";
+    } catch (_) {
+        return "";
+    }
+}
+
+function findOpenFlowProjectTab() {
+    return new Promise((resolve) => {
+        chrome.tabs.query({ url: `${FLOW_ROOT_URL}/*` }, (tabs) => {
+            if (chrome.runtime.lastError || !Array.isArray(tabs)) {
+                resolve(null);
+                return;
+            }
+            const projectTabs = tabs
+                .filter(tab => Number.isInteger(tab.id) && flowProjectIdFromUrl(tab.url))
+                .sort((left, right) => {
+                    if (Boolean(left.active) !== Boolean(right.active)) {
+                        return left.active ? -1 : 1;
+                    }
+                    return Number(right.lastAccessed || 0) - Number(left.lastAccessed || 0);
+                });
+            resolve(projectTabs[0] || null);
+        });
+    });
+}
+
 function ensureReconnectAlarm() {
     chrome.alarms.create(RECONNECT_ALARM_NAME, {
         periodInMinutes: RECONNECT_ALARM_PERIOD_MINUTES
@@ -484,7 +523,11 @@ async function connectWS() {
             }, 20000);
         };
 
-        let requestQueue = Promise.resolve();
+        // Generation can occupy a Flow tab for several minutes. Credential
+        // refresh uses a separate temporary tab and must not wait behind that
+        // work, otherwise an expiring session can disconnect while queued.
+        let generationRequestQueue = Promise.resolve();
+        let credentialRequestQueue = Promise.resolve();
 
         socket.onmessage = async (event) => {
             if (ws !== socket) return;
@@ -515,21 +558,45 @@ async function connectWS() {
             }
 
             if (data.type === "get_token") {
-                requestQueue = requestQueue.then(() => handleGetToken(data, socket)).catch(err => {
+                generationRequestQueue = generationRequestQueue.then(() => handleGetToken(data, socket)).catch(err => {
                     console.error("[Flow2API] Queue Error:", err);
                 });
             }
 
             if (data.type === "get_session_cookie") {
-                requestQueue = requestQueue.then(() => handleGetSessionCookie(data, socket)).catch(err => {
+                credentialRequestQueue = credentialRequestQueue.then(() => handleGetSessionCookie(data, socket)).catch(err => {
                     console.error("[Flow2API] Session cookie queue error:", err);
                 });
             }
 
             if (data.type === "submit_flow_request") {
-                requestQueue = requestQueue.then(() => handleSubmitFlowRequest(data, socket)).catch(err => {
-                    console.error("[Flow2API] Flow submit queue error:", err);
-                });
+                // A request can wait behind another generation in this profile.
+                // Keep the server-side watchdog alive until this request owns the
+                // extension queue; otherwise it is falsely failed as "dispatched".
+                sendFlowSubmitProgress(data, socket, "extension_queued");
+                const queuedProgressMonitor = setInterval(() => {
+                    sendFlowSubmitProgress(data, socket, "extension_queued");
+                }, FLOW_PROGRESS_POLL_INTERVAL_MS);
+                queuedFlowSubmitMonitors.set(String(data.req_id || ""), queuedProgressMonitor);
+                generationRequestQueue = generationRequestQueue
+                    .then(() => {
+                        clearInterval(queuedProgressMonitor);
+                        queuedFlowSubmitMonitors.delete(String(data.req_id || ""));
+                        if (cancelledFlowSubmitRequestIds.delete(String(data.req_id || ""))) {
+                            return undefined;
+                        }
+                        sendFlowSubmitProgress(data, socket, "extension_starting");
+                        return handleSubmitFlowRequest(data, socket);
+                    })
+                    .catch(err => {
+                        clearInterval(queuedProgressMonitor);
+                        queuedFlowSubmitMonitors.delete(String(data.req_id || ""));
+                        console.error("[Flow2API] Flow submit queue error:", err);
+                    });
+            }
+
+            if (data.type === "cancel_flow_request") {
+                await cancelFlowSubmitRequest(data);
             }
         };
 
@@ -616,14 +683,14 @@ async function fetchCurrentFlowImage(rawUrl) {
     let lastStatus = 0;
     for (const candidate of [...new Set(candidates)]) {
         try {
-            const response = await fetch(candidate, { credentials: "include" });
+            const response = await fetch(candidate, { credentials: "include", signal: AbortSignal.timeout(10000) });
             lastStatus = response.status;
             const mimeType = String(response.headers.get("content-type") || "")
                 .split(";", 1)[0]
                 .trim();
             if (!response.ok || !mimeType.startsWith("image/")) continue;
             const bytes = new Uint8Array(await response.arrayBuffer());
-            if (!bytes.length) continue;
+            if (!bytes.length || bytes.length > 20_000_000) continue;
             let binary = "";
             const chunkSize = 0x8000;
             for (let offset = 0; offset < bytes.length; offset += chunkSize) {
@@ -643,7 +710,133 @@ async function fetchCurrentFlowImage(rawUrl) {
     );
 }
 
-async function embedCurrentFlowImages(responseText) {
+async function fetchCurrentFlowImageFromTab(tabId, rawUrl) {
+    const sourceUrl = String(rawUrl || "").trim();
+    if (!tabId || !isCurrentFlowImageUrl(sourceUrl)) {
+        throw new Error("Flow UI returned an unsupported image URL");
+    }
+    const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: async url => {
+            const candidates = [];
+            if (/=s\d+(?:-[a-z0-9-]+)?(?=$|[?#])/i.test(url)) {
+                candidates.push(url.replace(
+                    /=s\d+(?:-[a-z0-9-]+)?(?=$|[?#])/i,
+                    "=s2048-rw",
+                ));
+            }
+            candidates.push(url);
+            let lastStatus = 0;
+            for (const candidate of [...new Set(candidates)]) {
+                try {
+                    const response = await fetch(candidate, {
+                        credentials: "include",
+                        signal: AbortSignal.timeout(10000),
+                    });
+                    lastStatus = response.status;
+                    const mimeType = String(response.headers.get("content-type") || "")
+                        .split(";", 1)[0]
+                        .trim();
+                    if (!response.ok || !mimeType.startsWith("image/")) continue;
+                    const bytes = new Uint8Array(await response.arrayBuffer());
+                    if (!bytes.length || bytes.length > 20_000_000) continue;
+                    let binary = "";
+                    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+                        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+                    }
+                    return {
+                        encodedImage: btoa(binary),
+                        mimeType,
+                        url: candidate,
+                    };
+                } catch (_) {
+                    // The extension worker fallback below has broader host access.
+                }
+            }
+            throw new Error(`Flow page image download failed (HTTP ${lastStatus || "unknown"})`);
+        },
+        args: [sourceUrl],
+    });
+    const payload = results && results[0] && results[0].result;
+    if (!payload || !payload.encodedImage || !String(payload.mimeType || "").startsWith("image/")) {
+        throw new Error("Flow page returned no downloadable image");
+    }
+    return payload;
+}
+
+// Google recompresses uploads, so byte hashes cannot distinguish a reference
+// thumbnail from a newly generated image. Decode in the extension worker,
+// whose existing host permissions allow reading Flow's image pixels.
+async function flowImageFingerprint(encoded, mimeType) {
+    if (!encoded || encoded.length > 28_000_000) throw new Error("Invalid Flow image for result validation");
+    const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: mimeType || "image/jpeg" }));
+    try {
+        const canvas = new OffscreenCanvas(64, 64);
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context) throw new Error("Flow result validation is unavailable");
+        context.fillStyle = "white";
+        context.fillRect(0, 0, 64, 64);
+        context.drawImage(bitmap, 0, 0, 64, 64);
+        return { aspect: bitmap.width / bitmap.height, pixels: context.getImageData(0, 0, 64, 64).data };
+    } finally {
+        bitmap.close();
+    }
+}
+
+function sameFlowImage(left, right) {
+    if (Math.abs(left.aspect - right.aspect) > 0.02 || left.pixels.length !== right.pixels.length) return false;
+    let difference = 0;
+    let changed = 0;
+    for (let index = 0; index < left.pixels.length; index += 4) {
+        let pixelDifference = 0;
+        for (let channel = 0; channel < 3; channel++) pixelDifference += Math.abs(left.pixels[index + channel] - right.pixels[index + channel]);
+        difference += pixelDifference;
+        if (pixelDifference / 3 > 15) changed++;
+    }
+    const count = left.pixels.length / 4;
+    return count > 0 && difference / (count * 3) <= 2 && changed / count <= 0.03;
+}
+
+function createFlowResultValidator(uploads, download = fetchCurrentFlowImage, fingerprint = flowImageFingerprint) {
+    let references;
+    const checked = new Map();
+    const accepted = new Map();
+    return {
+        accepted,
+        async check(asset) {
+            // Validate before fetching; page-visible candidates cannot change destinations.
+            if (!asset || !asset.identity || !isCurrentFlowImageUrl(asset.url)) {
+                return { status: "error", reason: "invalid_asset" };
+            }
+            const cacheKey = `${asset.identity}|${asset.url}`;
+            if (checked.has(cacheKey)) return checked.get(cacheKey);
+            if (checked.size >= 32) return { status: "error" };
+            try {
+                references ||= Promise.all(uploads.map(upload => fingerprint(upload.imageBytes, upload.mimeType)));
+                const referenceImages = await references;
+                const payload = await download(asset.url);
+                const candidate = await fingerprint(payload.encodedImage, payload.mimeType);
+                const status = referenceImages.some(reference => sameFlowImage(reference, candidate)) ? "reference" : "accepted";
+                if (status === "accepted") accepted.set(asset.url, payload);
+                const result = { identity: asset.identity, url: asset.url, status };
+                checked.set(cacheKey, result);
+                return result;
+            } catch (error) {
+                // Never accept an image whose pixels could not be checked.
+                return {
+                    identity: asset.identity,
+                    url: asset.url,
+                    status: "error",
+                    reason: String(error && error.message || "image_check_failed").slice(0, 160),
+                };
+            }
+        },
+    };
+}
+
+async function embedCurrentFlowImages(responseText, acceptedImages = new Map()) {
     let payload;
     try {
         payload = JSON.parse(String(responseText || ""));
@@ -656,7 +849,7 @@ async function embedCurrentFlowImages(responseText) {
     for (const media of payload.media) {
         const generatedImage = media && media.image && media.image.generatedImage;
         if (!generatedImage || generatedImage.encodedImage) continue;
-        const imagePayload = await fetchCurrentFlowImage(generatedImage.fifeUrl);
+        const imagePayload = acceptedImages.get(generatedImage.fifeUrl) || await fetchCurrentFlowImage(generatedImage.fifeUrl);
         generatedImage.fifeUrl = imagePayload.url;
         generatedImage.encodedImage = imagePayload.encodedImage;
         generatedImage.mimeType = imagePayload.mimeType;
@@ -664,28 +857,210 @@ async function embedCurrentFlowImages(responseText) {
     return JSON.stringify(payload);
 }
 
+async function validateCurrentFlowImages(responseText, validator) {
+    let payload;
+    try {
+        payload = JSON.parse(String(responseText || ""));
+    } catch (error) {
+        throw new Error("Flow reference result validation received invalid JSON");
+    }
+    if (payload.flow2apiTransport !== "flow_google_ui" || !Array.isArray(payload.media)) {
+        return String(responseText || "");
+    }
+    const baselineIdentities = Array.isArray(payload.flow2apiBaselineIdentities)
+        ? payload.flow2apiBaselineIdentities.map(value => String(value || "")).filter(Boolean)
+        : [];
+    delete payload.flow2apiBaselineIdentities;
+    const verdicts = [];
+    const rejectedIdentities = [];
+    for (const media of payload.media.slice(0, 16)) {
+        const generatedImage = media && media.image && media.image.generatedImage;
+        const identity = String(generatedImage && generatedImage.flow2apiIdentity || "");
+        const url = String(generatedImage && generatedImage.fifeUrl || "");
+        if (generatedImage) delete generatedImage.flow2apiIdentity;
+        const verdict = await validator.check({ identity, url });
+        verdicts.push(verdict);
+        if (identity) rejectedIdentities.push(identity);
+        if (verdict.status === "accepted") {
+            // One validated result matches the legacy response contract and keeps
+            // post-generation validation bounded even if Flow exposes many assets.
+            payload.media = [media];
+            return JSON.stringify(payload);
+        }
+    }
+    if (verdicts.some(verdict => verdict.status === "reference")) {
+        const error = new Error("Flow result validation found only the uploaded reference image");
+        error.flow2apiReferenceOnly = true;
+        error.flow2apiIgnoredIdentities = [...new Set([
+            ...baselineIdentities,
+            ...rejectedIdentities,
+        ])];
+        throw error;
+    }
+    const reason = verdicts.find(verdict => verdict.reason)?.reason || "no_candidate";
+    throw new Error(`Flow result image could not be verified (${reason})`);
+}
+
+async function readCurrentFlowImageCandidates(tabId) {
+    const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: () => {
+            const assets = new Map();
+            const normalizedText = value => String(value || "").replace(/\s+/g, " ").trim();
+            const generationActive = Array.from(document.querySelectorAll("button"))
+                .filter(button => {
+                    const rect = button.getBoundingClientRect();
+                    const style = getComputedStyle(button);
+                    return rect.width > 0 && rect.height > 0
+                        && style.display !== "none" && style.visibility !== "hidden";
+                })
+                .some(button => {
+                    const label = normalizedText([
+                        button.getAttribute("aria-label"),
+                        button.getAttribute("title"),
+                        button.textContent,
+                    ].filter(Boolean).join(" ")).toLowerCase();
+                    const icons = Array.from(button.querySelectorAll("mat-icon, i"))
+                        .map(icon => normalizedText(icon.textContent).toLowerCase());
+                    return icons.includes("stop")
+                        || /generating (?:an )?image|이미지 생성 중|이미지를 생성 중/.test(label);
+                });
+            document.querySelectorAll("img").forEach(image => {
+                if (!image.complete || !image.naturalWidth
+                    || image.closest('flow-prompt-box, flow-add-menu-popover-content, [contenteditable="true"]')) return;
+                try {
+                    const parsed = new URL(String(image.currentSrc || image.src || ""), location.href);
+                    let mediaId = "";
+                    const isGoogleImageHost = (
+                        parsed.hostname === "flow.google.com"
+                        || parsed.hostname === "flow-content.google"
+                        || parsed.hostname === "lh3.google.com"
+                        || /(^|\.)googleusercontent\.com$/.test(parsed.hostname)
+                    );
+                    if (parsed.hostname === "flow-content.google") {
+                        const match = parsed.pathname.match(
+                            /^\/(?:image|video)\/([0-9a-f]{8}-[0-9a-f-]{27,})/i
+                        );
+                        mediaId = match ? match[1] : "";
+                    }
+                    if (!mediaId && isGoogleImageHost) {
+                        const candidate = parsed.searchParams.get("name") || "";
+                        if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(candidate)) mediaId = candidate;
+                    }
+                    const isCurrentFlowAsset = (
+                        parsed.hostname === "flow.google.com" && parsed.pathname.startsWith("/asb/")
+                    ) || (
+                        /(^|\.)googleusercontent\.com$/.test(parsed.hostname) && parsed.pathname.includes("/asb/")
+                    ) || (
+                        parsed.hostname === "lh3.google.com" && parsed.pathname.startsWith("/rd-asb/")
+                    );
+                    if (!mediaId && !isCurrentFlowAsset) return;
+                    const canonicalUrl = parsed.toString().replace(
+                        /=s\d+(?:-[a-z0-9-]+)?(?=$|[?#])/i,
+                        "",
+                    );
+                    const identity = mediaId ? `media:${mediaId}` : `url:${canonicalUrl}`;
+                    assets.set(identity, { identity, mediaId, url: parsed.toString() });
+                } catch (_) {
+                    // Ignore unrelated or malformed page images.
+                }
+            });
+            return { generationActive, assets: Array.from(assets.values()).slice(0, 32) };
+        },
+    });
+    const payload = results && results[0] && results[0].result;
+    return {
+        generationActive: Boolean(payload && payload.generationActive),
+        assets: Array.isArray(payload && payload.assets) ? payload.assets : [],
+    };
+}
+
+async function waitForValidatedFlowImage(tabId, responseText, validator, data, socket, ignoredValues) {
+    const original = JSON.parse(String(responseText || ""));
+    const template = original.media && original.media[0]
+        && original.media[0].image && original.media[0].image.generatedImage;
+    if (!template) throw new Error("Flow result validation cannot resume without image metadata");
+    const ignored = new Set((ignoredValues || []).map(value => String(value || "")).filter(Boolean));
+    const deadline = Date.now() + 120000;
+    let stableIds = "";
+    let stablePolls = 0;
+    while (Date.now() < deadline) {
+        if (cancelledFlowSubmitRequestIds.has(String(data.req_id || ""))) {
+            throw new Error("Flow browser submit cancelled");
+        }
+        const page = await readCurrentFlowImageCandidates(tabId);
+        sendFlowSubmitProgress(
+            data,
+            socket,
+            page.generationActive ? "generation_active" : "waiting_for_result",
+        );
+        const fresh = page.assets.filter(asset => !ignored.has(String(asset.identity || "")));
+        const ids = fresh.map(asset => String(asset.identity || "")).sort().join(",");
+        stablePolls = ids && ids === stableIds ? stablePolls + 1 : ids ? 1 : 0;
+        stableIds = ids;
+        if (stablePolls >= 3) {
+            for (const asset of fresh) {
+                const candidate = {
+                    media: [{
+                        name: asset.mediaId || "",
+                        image: {
+                            generatedImage: {
+                                ...template,
+                                mediaId: asset.mediaId || "",
+                                fifeUrl: asset.url,
+                                flow2apiIdentity: asset.identity,
+                            },
+                        },
+                    }],
+                    flow2apiTransport: "flow_google_ui",
+                };
+                const verdict = await validator.check(asset);
+                if (verdict.status === "accepted") {
+                    return validateCurrentFlowImages(JSON.stringify(candidate), validator);
+                }
+                if (verdict.status === "reference") ignored.add(String(asset.identity || ""));
+            }
+            stableIds = "";
+            stablePolls = 0;
+        }
+        await sleep(700);
+    }
+    throw new Error("Timed out waiting for a generated image after the uploaded reference image");
+}
+
 async function handleGetSessionCookie(data, socket) {
-    let newTabId = null;
+    let authTabId = null;
+    let closeAuthTab = false;
     try {
         const projectId = String(data.project_id || "").trim();
+        let observedProjectId = projectId;
         const authCaptureStartedAt = Date.now();
         let pageAuthContext = { auth_user: "0", api_key: "" };
-        if (projectId) {
-            // Discard any authorization replayed by an earlier extension
-            // probe. Only trust a header observed from this fresh Flow page.
-            await writeSessionStorage({ [FLOW_REQUEST_AUTH_STORAGE_KEY]: null });
+
+        if (!projectId) {
+            const openProjectTab = await findOpenFlowProjectTab();
+            if (openProjectTab) {
+                authTabId = openProjectTab.id;
+                observedProjectId = flowProjectIdFromUrl(openProjectTab.url);
+            }
+        }
+
+        if (!authTabId) {
             const newTab = await chrome.tabs.create({
                 url: buildFlowPageUrl(projectId),
                 active: false,
             });
-            newTabId = newTab.id;
-            await waitForTabReady(newTabId);
-            pageAuthContext = await readFlowPageAuthContext(newTabId);
+            authTabId = newTab.id;
+            closeAuthTab = true;
         }
+        await waitForTabReady(authTabId);
+        pageAuthContext = await readFlowPageAuthContext(authTabId);
 
-        let requestAuthorization = projectId
-            ? await waitForRecentFlowRequestAuthorization(authCaptureStartedAt, 3000)
-            : null;
+        let requestAuthorization = await waitForRecentFlowRequestAuthorization(
+            authCaptureStartedAt,
+            3000
+        );
         if (!requestAuthorization) {
             requestAuthorization = await getRecentFlowRequestAuthorization();
         }
@@ -695,21 +1070,21 @@ async function handleGetSessionCookie(data, socket) {
         let capturedAuth = observedBearer
             ? { access_token: observedBearer, captured_at: requestAuthorization.seen_at }
             : (!requestAuthorization ? await getRecentFlowAccessToken() : null);
-        if (!capturedAuth && !requestAuthorization && projectId) {
+        if (!capturedAuth && !requestAuthorization && authTabId) {
             capturedAuth = await waitForRecentFlowAccessToken(1000);
         }
-        const cookieAuthorization = !capturedAuth && newTabId
+        const cookieAuthorization = !capturedAuth && authTabId
             ? (
                 requestAuthorization && requestAuthorization.authorization ||
                 await buildGoogleCookieAuthorization(FLOW_ROOT_URL)
             )
             : "";
-        const browserAuth = !capturedAuth && newTabId
+        const browserAuth = !capturedAuth && authTabId
             ? await (async () => {
-                ignoreFlowAuthorizationCaptureUntil = Date.now() + 15000;
+                ignoredFlowAuthorizationTabIds.add(authTabId);
                 try {
                     return await probeBrowserFlowAuthentication(
-                        newTabId,
+                        authTabId,
                         cookieAuthorization,
                         requestAuthorization && requestAuthorization.auth_user
                             || pageAuthContext.auth_user,
@@ -717,7 +1092,7 @@ async function handleGetSessionCookie(data, socket) {
                             || pageAuthContext.api_key
                     );
                 } finally {
-                    ignoreFlowAuthorizationCaptureUntil = Date.now() + 500;
+                    ignoredFlowAuthorizationTabIds.delete(authTabId);
                 }
             })()
             : null;
@@ -741,6 +1116,7 @@ async function handleGetSessionCookie(data, socket) {
                 observed_auth_scheme: String(authObservation.auth_scheme || "none").slice(0, 32),
                 observed_auth_at: Number(authObservation.seen_at || 0) || null,
                 observed_api_key: Boolean(authObservation.api_key || pageAuthContext.api_key),
+                project_id: observedProjectId,
                 credits: browserAuthValid ? browserAuth.credits : null,
                 user_paygate_tier: browserAuthValid ? browserAuth.user_paygate_tier : "",
             }, socket);
@@ -753,6 +1129,7 @@ async function handleGetSessionCookie(data, socket) {
                 observed_auth_scheme: String(authObservation.auth_scheme || "none").slice(0, 32),
                 observed_auth_at: Number(authObservation.seen_at || 0) || null,
                 observed_api_key: Boolean(authObservation.api_key || pageAuthContext.api_key),
+                project_id: observedProjectId,
             }, socket);
         }
     } catch (err) {
@@ -762,9 +1139,9 @@ async function handleGetSessionCookie(data, socket) {
             error: err.message || "세션 쿠키 읽기 실패"
         }, socket);
     } finally {
-        if (newTabId) {
+        if (authTabId && closeAuthTab) {
             try {
-                await chrome.tabs.remove(newTabId);
+                await chrome.tabs.remove(authTabId);
             } catch (e) {
                 console.log("[Flow2API] Error closing auth refresh tab:", e);
             }
@@ -772,8 +1149,94 @@ async function handleGetSessionCookie(data, socket) {
     }
 }
 
+function sendFlowSubmitProgress(data, socket, phase) {
+    sendSocketMessage({
+        type: "flow_submit_progress",
+        req_id: data.req_id,
+        phase: String(phase || "active").slice(0, 64),
+    }, socket);
+}
+
+function forwardFlowSubmitProgress(message, sender) {
+    const tabId = Number(sender && sender.tab && sender.tab.id);
+    const active = activeFlowSubmitBridges.get(tabId);
+    if (!active) return;
+
+    const requestId = String(message && message.request_id || "").trim();
+    const phase = String(message && message.phase || "").trim();
+    const updatedAt = Number(message && message.updated_at || 0);
+    if (
+        requestId !== active.requestId ||
+        !/^[^\x00-\x1F\x7F]{1,64}$/.test(phase) ||
+        !Number.isFinite(updatedAt) ||
+        updatedAt <= active.lastUpdatedAt
+    ) {
+        return;
+    }
+
+    active.lastUpdatedAt = updatedAt;
+    active.lastPhase = phase;
+    sendFlowSubmitProgress(active.data, active.socket, phase);
+}
+
+function sendActiveFlowSubmitHeartbeat(tabId) {
+    const active = activeFlowSubmitBridges.get(Number(tabId));
+    if (!active) return;
+    sendFlowSubmitProgress(
+        active.data,
+        active.socket,
+        active.lastPhase || "extension_active"
+    );
+}
+
+async function cancelFlowSubmitRequest(data) {
+    const requestId = String(data && data.req_id || "").trim();
+    if (!requestId) return;
+
+    cancelledFlowSubmitRequestIds.add(requestId);
+    const queuedMonitor = queuedFlowSubmitMonitors.get(requestId);
+    if (queuedMonitor) clearInterval(queuedMonitor);
+    queuedFlowSubmitMonitors.delete(requestId);
+
+    const tabIds = [];
+    for (const [tabId, active] of activeFlowSubmitBridges.entries()) {
+        if (active.requestId === requestId) tabIds.push(Number(tabId));
+    }
+    if (!tabIds.length) return;
+
+    try {
+        await chrome.tabs.remove(tabIds);
+        console.log("[Flow2API] Cancelled timed-out Flow submit tab.");
+    } catch (error) {
+        console.log("[Flow2API] Could not close cancelled Flow submit tab:", error);
+    }
+}
+
+function flowUiNeedsUserAction(responseText) {
+    try {
+        const payload = JSON.parse(String(responseText || ""));
+        const message = String(payload && payload.error && payload.error.message || "");
+        const diagnostics = JSON.parse(message.split("; UI: ").pop());
+        const buttons = new Set((diagnostics.buttons || []).map(value => String(value || "").trim()));
+        const dialogs = (diagnostics.dialogs || []).map(value => String(value || "")).join(" ");
+        return (
+            (buttons.has("동의함") && buttons.has("나중에"))
+            || (buttons.has("I agree") && buttons.has("Not now"))
+            || /이 이미지를 사용할 권리|rights to use this image/i.test(dialogs)
+        );
+    } catch (error) {
+        return false;
+    }
+}
+
 async function handleSubmitFlowRequest(data, socket) {
     let newTabId = null;
+    let preserveTabForUserAction = false;
+    let progressMonitor = null;
+    let hardTimeoutHandle = null;
+    let progressPollRunning = false;
+    let lastProgressUpdatedAt = 0;
+    let imageValidator = null;
     try {
         const targetUrl = new URL(String(data.url || ""));
         if (
@@ -791,11 +1254,21 @@ async function handleSubmitFlowRequest(data, socket) {
         const flowPageUrl = buildFlowPageUrl(projectId);
         const authCaptureStartedAt = Date.now();
         console.log("[Flow2API] Opening mapped Flow project for browser-side submit...");
-        const newTab = await chrome.tabs.create({ url: flowPageUrl, active: false });
+        sendFlowSubmitProgress(data, socket, "opening_tab");
+        const newTab = await chrome.tabs.create({ url: flowPageUrl, active: String(data.action || "").toUpperCase() === "VIDEO_GENERATION" });
         newTabId = newTab.id;
+        activeFlowSubmitBridges.set(newTabId, {
+            requestId: String(data.req_id || ""),
+            data,
+            socket,
+            lastUpdatedAt: 0,
+            lastPhase: "opening_tab",
+        });
 
         await waitForTabReady(newTabId);
         await sleep(1200);
+        activeFlowSubmitBridges.get(newTabId).lastPhase = "tab_ready";
+        sendFlowSubmitProgress(data, socket, "tab_ready");
 
         const pageAuthContext = await readFlowPageAuthContext(newTabId);
         let requestAuthorization = await getRecentFlowRequestAuthorization(authCaptureStartedAt);
@@ -810,12 +1283,33 @@ async function handleSubmitFlowRequest(data, socket) {
             || pageAuthContext.api_key;
 
         let results;
-        ignoreFlowAuthorizationCaptureUntil = Date.now() + Math.max(
-            45000,
-            Number(data.timeout_ms || 60000) + 30000
+        const usesCurrentFlowUi = (
+            (String(data.action || "").trim().toUpperCase() === "IMAGE_GENERATION"
+            && /\/flowMedia:batchGenerateImages$/.test(targetUrl.pathname))
+            || (String(data.action || "").trim().toUpperCase() === "VIDEO_GENERATION"
+            && /\/video:batchAsyncGenerateVideo(?:StartImage|Text)$/.test(targetUrl.pathname))
         );
+        if (usesCurrentFlowUi && String(data.action || "").toUpperCase() === "IMAGE_GENERATION") {
+            const uploads = data.body?.__flow2apiUiContext?.inputUploads || [];
+            const inputs = data.body?.requests?.[0]?.imageInputs || [];
+            if (uploads.length !== inputs.length) throw new Error("Flow reference result validation requires the original reference bytes");
+            imageValidator = createFlowResultValidator(uploads, async url => {
+                try {
+                    // The long MAIN-world generation script has returned before
+                    // validation starts, so this short page-context fetch cannot
+                    // deadlock behind it and inherits Flow's first-party session.
+                    return await fetchCurrentFlowImageFromTab(newTabId, url);
+                } catch (pageError) {
+                    return fetchCurrentFlowImage(url);
+                }
+            });
+        }
+        if (!usesCurrentFlowUi) {
+            ignoredFlowAuthorizationTabIds.add(newTabId);
+        }
         try {
-            results = await chrome.scripting.executeScript({
+            activeFlowSubmitBridges.get(newTabId).lastPhase = "script_dispatched";
+            const executionPromise = chrome.scripting.executeScript({
                 target: { tabId: newTabId },
                 world: "MAIN",
                 func: async (
@@ -826,9 +1320,36 @@ async function handleSubmitFlowRequest(data, socket) {
                 googleAuthUser,
                 googleApiKey,
                 requestBody,
-                timeoutMs
+                timeoutMs,
+                requestId
             ) => {
                 const websiteKey = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
+                let lastProgressSignalAt = 0;
+                let lastProgressSignalPhase = "";
+                const reportProgress = phase => {
+                    const normalizedPhase = String(phase || "active").slice(0, 64);
+                    const updatedAt = Date.now();
+                    window.__FLOW2API_BROWSER_SUBMIT_PROGRESS__ = {
+                        request_id: requestId,
+                        phase: normalizedPhase,
+                        updated_at: updatedAt,
+                    };
+                    if (
+                        normalizedPhase !== lastProgressSignalPhase ||
+                        updatedAt - lastProgressSignalAt >= 2000
+                    ) {
+                        lastProgressSignalAt = updatedAt;
+                        lastProgressSignalPhase = normalizedPhase;
+                        window.postMessage({
+                            source: "flow2api-submit-progress",
+                            type: "flow_submit_progress",
+                            request_id: requestId,
+                            phase: normalizedPhase,
+                            updated_at: updatedAt,
+                        }, location.origin);
+                    }
+                };
+                reportProgress("script_started");
                 const browserFingerprint = () => {
                     const languages = Array.from(
                         new Set(
@@ -898,6 +1419,8 @@ async function handleSubmitFlowRequest(data, socket) {
                 };
 
                 const submitImageThroughCurrentFlowUi = async (rawBody) => {
+                    const isVideo = action === "VIDEO_GENERATION";
+                    reportProgress("ui_preparing");
                     const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
                     const isVisible = element => {
                         if (!(element instanceof Element)) return false;
@@ -917,6 +1440,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         while (Date.now() < deadline) {
                             const value = probe();
                             if (value) return value;
+                            reportProgress(`waiting:${label}`);
                             await pause(200);
                         }
                         throw new Error(`Timed out waiting for ${label}`);
@@ -950,7 +1474,7 @@ async function handleSubmitFlowRequest(data, socket) {
                             );
                             if (parsed.hostname === "flow-content.google") {
                                 const match = parsed.pathname.match(
-                                    /^\/image\/([0-9a-f]{8}-[0-9a-f-]{27,})/i
+                                    /^\/(?:image|video)\/([0-9a-f]{8}-[0-9a-f-]{27,})/i
                                 );
                                 mediaId = match ? match[1] : "";
                             }
@@ -970,7 +1494,8 @@ async function handleSubmitFlowRequest(data, socket) {
                                 parsed.hostname === "lh3.google.com"
                                 && parsed.pathname.startsWith("/rd-asb/")
                             );
-                            if (!mediaId && !isCurrentFlowAsset) return null;
+                            const isLocalVideoBlob = isVideo && parsed.protocol === "blob:" && parsed.origin === location.origin;
+                            if (!mediaId && !isCurrentFlowAsset && !isLocalVideoBlob) return null;
 
                             const canonicalUrl = parsed.toString().replace(
                                 /=s\d+(?:-[a-z0-9-]+)?(?=$|[?#])/i,
@@ -985,23 +1510,90 @@ async function handleSubmitFlowRequest(data, socket) {
                             return null;
                         }
                     };
-                    const currentMediaAssets = () => {
+                    // Canvas-backed videos have a loaded poster and an editor button,
+                    // but no HTMLVideoElement. Keep the actual button with its asset.
+                    const currentVideoEditorAssets = (includePending = false) => {
                         const assets = new Map();
-                        document.querySelectorAll("img").forEach(image => {
+                        for (const image of document.querySelectorAll('img')) {
+                            if (!/^(생성된 동영상 썸네일|generated video thumbnail)$/i.test(normalizedText(image.alt))) continue;
+                            if (!includePending && (!image.complete || !image.naturalWidth)) continue;
+                            const button = image.closest('button');
+                            if (!button || !/^(편집기에서 동영상 열기|open video in editor)$/i.test(normalizedText(button.getAttribute('aria-label')))) continue;
                             const asset = mediaAssetFromUrl(image.currentSrc || image.src);
-                            if (asset) assets.set(asset.identity, asset);
+                            if (asset) assets.set(asset.identity, { ...asset, editorButton: button });
+                        }
+                        return assets;
+                    };
+                    const currentMediaAssets = (includePromptImages = false) => {
+                        const assets = isVideo ? currentVideoEditorAssets(includePromptImages) : new Map();
+                        document.querySelectorAll(isVideo ? "video" : "img").forEach(image => {
+                            if (!isVideo && (!image.complete || !image.naturalWidth)) return;
+                            if (!isVideo && image.closest("flow-add-menu-popover-content")) return;
+                            if (!isVideo && !includePromptImages
+                                && image.closest('flow-prompt-box, [contenteditable="true"]')) return;
+                            if (isVideo && (!Number.isFinite(image.duration) || image.duration < 7.9)) return;
+                            const asset = mediaAssetFromUrl(image.currentSrc || image.src || image.querySelector("source")?.src);
+                            if (asset) assets.set(asset.identity, isVideo ? { ...asset, duration: image.duration } : asset);
                         });
                         return assets;
                     };
+                    // Read actual generation cards separately from the agent's prose.
+                    const readVideoFailures = () => ({
+                        cards: new Map(Array.from(document.querySelectorAll("flow-error-tile"))
+                            .filter(isVisible).map(element => [element, normalizedText(element.innerText || element.textContent)])),
+                        reports: new Map(Array.from(document.querySelectorAll("flow-a2ui-text"))
+                            .filter(isVisible).map(element => [element, normalizedText(element.innerText || element.textContent)])),
+                    });
+                    const newVideoFailure = (baseline, current) => {
+                        const addedTexts = (before, after) => {
+                            const remaining = new Map();
+                            for (const text of before.values()) remaining.set(text, (remaining.get(text) || 0) + 1);
+                            return Array.from(after.values()).filter(text => {
+                                const count = remaining.get(text) || 0;
+                                if (count) { remaining.set(text, count - 1); return false; }
+                                return Boolean(text);
+                            });
+                        };
+                        for (const text of addedTexts(baseline.cards, current.cards)) {
+                            let code = "flow_video_generation_failed";
+                            let message = "Flow video generation failed; the error card did not specify a cause";
+                            if (/오디오를 생성할 수 없습니다|could(?:n['’]t| not) generate audio|audio generation failed/i.test(text)) {
+                                code = "flow_video_audio_failed";
+                                message = "Flow video audio generation failed";
+                            } else if (/unsafe_generation|safety filters|안전 필터|content policy|정책.*위반/i.test(text)) {
+                                code = "flow_video_policy_rejected";
+                                message = "Flow content policy rejected the video request";
+                            }
+                            return { code, message, source: "flow_error_tile", upstream_message: text.slice(0, 500) };
+                        }
+                        for (const text of addedTexts(baseline.reports, current.reports)) {
+                            if (/flagged by .*safety filters|blocked by .*safety filters|에이전트가 실패|생성할 수 없|unable to generate|couldn['’]t generate|can['’]t (?:create|generate)|not able to generate/i.test(text)) {
+                                return {
+                                    code: "flow_video_agent_reported_failure",
+                                    message: "Flow agent reported a failure; the generation cause is unverified",
+                                    source: "flow_agent_text",
+                                    upstream_message: text.slice(0, 500),
+                                };
+                            }
+                        }
+                        return null;
+                    };
+
                     const countFailureSignals = () => {
                         const text = normalizedText(document.body && document.body.innerText).toLowerCase();
                         const signals = [
                             "이미지를 생성할 수 없습니다",
+                            "영상을 생성할 수 없습니다",
+                            "오디오를 생성할 수 없습니다",
+                            "couldn't generate audio",
+                            "audio generation failed",
                             "unable to generate",
                             "couldn't generate",
                             "can't create",
                             "not able to generate",
                             "content policy",
+                            "safety filters",
+                            "안전 필터",
                             "에이전트가 실패했습니다",
                             "agent failed",
                         ];
@@ -1016,10 +1608,36 @@ async function handleSubmitFlowRequest(data, socket) {
                         }, 0);
                     };
 
+                    const imageGenerationIsActive = () => Array.from(document.querySelectorAll("button"))
+                        .filter(isVisible)
+                        .some(button => {
+                            const label = normalizedText([
+                                button.getAttribute("aria-label"),
+                                button.getAttribute("title"),
+                                button.textContent,
+                            ].filter(Boolean).join(" ")).toLowerCase();
+                            const icons = Array.from(button.querySelectorAll("mat-icon, i"))
+                                .map(icon => normalizedText(icon.textContent).toLowerCase());
+                            const disabled = button.disabled || button.getAttribute("aria-disabled") === "true";
+                            return icons.includes("stop")
+                                || /generating (?:an )?image|이미지 생성 중|이미지를 생성 중/.test(label)
+                                || (disabled && /initiating image generation|이미지 생성 시작/.test(label));
+                        });
+
+                    const nextImageFailurePollCount = (hasNewFailure, generationActive, previousCount) => (
+                        hasNewFailure && !generationActive ? previousCount + 1 : 0
+                    );
+
                     const requests = Array.isArray(rawBody && rawBody.requests)
                         ? rawBody.requests
                         : [];
-                    const imageRequest = requests[0] || {};
+                    const rawRequest = requests[0] || {};
+                    const imageRequest = isVideo ? {
+                        ...rawRequest,
+                        structuredPrompt: rawRequest.textInput?.structuredPrompt,
+                        imageAspectRatio: String(rawRequest.aspectRatio || "").replace("VIDEO_", "IMAGE_"),
+                        imageInputs: rawRequest.startImage ? [rawRequest.startImage] : [],
+                    } : rawRequest;
                     const promptParts = imageRequest.structuredPrompt
                         && Array.isArray(imageRequest.structuredPrompt.parts)
                         ? imageRequest.structuredPrompt.parts
@@ -1029,7 +1647,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         .filter(Boolean)
                         .join("\n");
                     if (!prompt) {
-                        throw new Error("Flow UI image fallback requires a prompt");
+                        throw new Error("Flow UI generation requires a prompt");
                     }
 
                     const aspectLabels = {
@@ -1047,7 +1665,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         HARBOR_SEAL: "Nano Banana 2 Lite",
                     };
                     const requestedAspect = aspectLabels[imageRequest.imageAspectRatio] || "";
-                    const requestedModel = modelLabels[imageRequest.imageModelName] || "Nano Banana 2";
+                    const requestedModel = isVideo ? "Veo 3.1 Fast" : modelLabels[imageRequest.imageModelName] || "Nano Banana 2";
                     const privateUiContext = rawBody && rawBody.__flow2apiUiContext || {};
                     const inputFileNames = Array.isArray(privateUiContext.inputFileNames)
                         ? privateUiContext.inputFileNames.map(normalizedText).filter(Boolean)
@@ -1071,7 +1689,7 @@ async function handleSubmitFlowRequest(data, socket) {
                     // The current flow.google.com editor keeps image defaults in
                     // a sticky settings panel. Align them before submitting so
                     // the browser fallback preserves the API request semantics.
-                    try {
+                    if (!isVideo) try {
                         const settingsTrigger = await waitFor(
                             () => {
                                 const legacy = document.querySelector(".settings-trigger-button");
@@ -1170,11 +1788,6 @@ async function handleSubmitFlowRequest(data, socket) {
                         }
 
                         const picker = await openAssetPicker();
-                        const baselineAssets = new Set(
-                            Array.from(picker.querySelectorAll('button.asset-item[role="option"] img'))
-                                .map(image => String(image.currentSrc || image.src || "").trim())
-                                .filter(Boolean)
-                        );
                         const uploadButton = await waitFor(
                             () => {
                                 const legacy = picker.querySelector(".sidebar-upload-btn");
@@ -1213,6 +1826,22 @@ async function handleSubmitFlowRequest(data, socket) {
                         }
                         try {
                             clickElement(uploadButton);
+                            const uploadGate = await waitFor(() => {
+                                const dialog = Array.from(document.querySelectorAll('[role="dialog"], mat-dialog-container'))
+                                    .find(element => isVisible(element) && /이 이미지를 사용할 권리|rights to use this image/i.test(normalizedText(element.textContent)));
+                                if (dialog) return { dialog };
+                                return capturedInput ? { input: capturedInput } : null;
+                            }, 6000, "Flow upload permission or file input");
+                            if (uploadGate.dialog) {
+                                if (upload.rightsConfirmed !== true) {
+                                    throw new Error("Flow image rights confirmation is required for this reference image");
+                                }
+                                const agree = Array.from(uploadGate.dialog.querySelectorAll("button"))
+                                    .find(button => isVisible(button) && /^(동의(?:함)?|agree|i agree)$/i.test(normalizedText(button.textContent)));
+                                if (!agree) throw new Error("Flow image rights confirmation button is unavailable");
+                                clickElement(agree);
+                                await waitFor(() => capturedInput, 6000, "Flow approved upload file input");
+                            }
                             await pause(150);
                         } finally {
                             HTMLInputElement.prototype.click = originalInputClick;
@@ -1248,8 +1877,22 @@ async function handleSubmitFlowRequest(data, socket) {
                         fileInput.dispatchEvent(new Event("input", { bubbles: true }));
                         fileInput.dispatchEvent(new Event("change", { bubbles: true }));
 
+                        const uploadSearch = picker.querySelector('input[type="text"]');
+                        if (uploadSearch) {
+                            setInputValue(uploadSearch, fileName);
+                            await pause(500);
+                        }
                         const uploadResult = await waitFor(
                             () => {
+                                const rightsDialog = Array.from(document.querySelectorAll('[role="dialog"], mat-dialog-container'))
+                                    .find(element => isVisible(element) && /이 이미지를 사용할 권리|rights to use this image/i.test(normalizedText(element.textContent)));
+                                if (rightsDialog) {
+                                    if (upload.rightsConfirmed !== true) throw new Error("Flow image rights confirmation is required for this reference image");
+                                    const agree = Array.from(rightsDialog.querySelectorAll("button"))
+                                        .find(button => isVisible(button) && /^(동의(?:함)?|agree|i agree)$/i.test(normalizedText(button.textContent)));
+                                    if (agree && !agree.disabled) clickElement(agree);
+                                    return null;
+                                }
                                 if (!isVisible(picker)) return { attached: true, option: null };
                                 const options = Array.from(
                                     picker.querySelectorAll('button.asset-item[role="option"]')
@@ -1258,12 +1901,7 @@ async function handleSubmitFlowRequest(data, socket) {
                                     normalizedText(option.textContent).includes(fileName)
                                 );
                                 if (byName) return { attached: false, option: byName };
-                                const fresh = options.find(option => {
-                                    const image = option.querySelector("img");
-                                    const source = String(image && (image.currentSrc || image.src) || "").trim();
-                                    return source && !baselineAssets.has(source);
-                                });
-                                return fresh ? { attached: false, option: fresh } : null;
+                                return null;
                             },
                             45000,
                             `Flow native upload ${fileName}`
@@ -1287,6 +1925,64 @@ async function handleSubmitFlowRequest(data, socket) {
                         await pause(500);
                     };
 
+                    const findGenerationApproval = () => {
+                        const canConfirmImageRights = Boolean(
+                            inputUploads.length
+                            && inputUploads.every(upload => upload.rightsConfirmed === true)
+                        );
+                        const candidates = document.querySelectorAll('button, [role="radio"], input[type="radio"]');
+                        for (const candidate of candidates) {
+                            if (candidate.disabled || candidate.getAttribute("aria-disabled") === "true"
+                                || candidate.checked || candidate.getAttribute("aria-checked") === "true") continue;
+                            const associatedLabel = candidate.labels && candidate.labels[0];
+                            const target = isVisible(candidate) ? candidate : associatedLabel;
+                            if (!target || !isVisible(target)) continue;
+                            const label = (associatedLabel || candidate).cloneNode(true);
+                            label.querySelectorAll('mat-icon, i, svg, [aria-hidden="true"]').forEach(icon => icon.remove());
+                            const text = normalizedText(candidate.getAttribute("aria-label") || label.textContent).toLowerCase();
+                            // Video permission is one generation only. Never select always-approve.
+                            if (isVideo ? /^(approve|승인)$/.test(text)
+                                : /^(approve|confirm|create|generate|yes,? create|yes,? generate|승인|확인|생성|만들기)$/.test(text)
+                                    || (canConfirmImageRights && /^(i agree|agree|allow|동의(?:함)?|허용)$/.test(text))) return target;
+                        }
+                        return null;
+                    };
+
+                    const directive = [
+                        isVideo ? `Create exactly one 8-second video${requestedInputs.length ? " using the attached product reference as the actual first frame and image input; inspect that image and preserve its exact appearance rather than choosing another project asset" : ""}. ${prompt}` : `Make me exactly one picture of ${prompt}`,
+                        requestedAspect ? `in a ${requestedAspect} aspect ratio` : "",
+                        requestedModel ? `using ${requestedModel}` : "",
+                    ].filter(Boolean).join(" ") + ".";
+                    const composer = await waitFor(
+                        () => Array.from(document.querySelectorAll('[contenteditable="true"]'))
+                            .find(isVisible),
+                        8000,
+                        "Flow prompt composer"
+                    );
+                    reportProgress("composer_ready");
+                    composer.focus();
+                    let inserted = false;
+                    if (typeof document.execCommand === "function") {
+                        const selection = getSelection();
+                        const range = document.createRange();
+                        range.selectNodeContents(composer);
+                        selection.removeAllRanges();
+                        selection.addRange(range);
+                        document.execCommand("delete", false, null);
+                        inserted = document.execCommand("insertText", false, directive);
+                    }
+                    if (!inserted) {
+                        const paragraph = document.createElement("p");
+                        paragraph.textContent = directive;
+                        composer.replaceChildren(paragraph);
+                        composer.dispatchEvent(new InputEvent("input", {
+                            bubbles: true,
+                            inputType: "insertText",
+                            data: directive,
+                        }));
+                    }
+
+                    // Finish clearing old text BEFORE attaching rich-text media references.
                     for (const upload of inputUploads) {
                         await attachNativeUpload(upload);
                     }
@@ -1317,44 +2013,15 @@ async function handleSubmitFlowRequest(data, socket) {
                         await pause(500);
                     }
 
-                    const firstBaseline = currentMediaAssets();
+                    // Include the attached prompt thumbnails in the baseline so
+                    // moving the same upload into a conversation card cannot be
+                    // mistaken for a newly generated result.
+                    const firstBaseline = currentMediaAssets(true);
                     await pause(700);
-                    const secondBaseline = currentMediaAssets();
+                    const secondBaseline = currentMediaAssets(true);
                     const baselineIds = new Set([...firstBaseline.keys(), ...secondBaseline.keys()]);
-                    const baselineFailureCount = countFailureSignals();
-
-                    const directive = [
-                        `Make me exactly one picture of ${prompt}`,
-                        requestedAspect ? `in a ${requestedAspect} aspect ratio` : "",
-                        requestedModel ? `using ${requestedModel}` : "",
-                    ].filter(Boolean).join(" ") + ".";
-                    const composer = await waitFor(
-                        () => Array.from(document.querySelectorAll('[contenteditable="true"]'))
-                            .find(isVisible),
-                        8000,
-                        "Flow prompt composer"
-                    );
-                    composer.focus();
-                    let inserted = false;
-                    if (typeof document.execCommand === "function") {
-                        const selection = getSelection();
-                        const range = document.createRange();
-                        range.selectNodeContents(composer);
-                        selection.removeAllRanges();
-                        selection.addRange(range);
-                        document.execCommand("delete", false, null);
-                        inserted = document.execCommand("insertText", false, directive);
-                    }
-                    if (!inserted) {
-                        const paragraph = document.createElement("p");
-                        paragraph.textContent = directive;
-                        composer.replaceChildren(paragraph);
-                        composer.dispatchEvent(new InputEvent("input", {
-                            bubbles: true,
-                            inputType: "insertText",
-                            data: directive,
-                        }));
-                    }
+                    const baselineFailureCount = isVideo ? 0 : countFailureSignals();
+                    const videoFailureBaseline = isVideo ? readVideoFailures() : null;
 
                     const submitButton = await waitFor(
                         () => {
@@ -1368,26 +2035,26 @@ async function handleSubmitFlowRequest(data, socket) {
                         "enabled Flow image submit button"
                     );
                     clickElement(submitButton);
+                    reportProgress("submitted");
 
-                    const uiTimeoutMs = Math.min(240000, Math.max(180000, timeoutMs));
+                    const uiTimeoutMs = isVideo ? Math.min(360000, Math.max(240000, timeoutMs)) : Math.min(240000, Math.max(180000, timeoutMs));
                     const deadline = Date.now() + uiTimeoutMs;
                     let stableIds = "";
                     let stablePolls = 0;
+                    let imageFailurePolls = 0;
                     let confirmationClicked = false;
                     while (Date.now() < deadline) {
                         await pause(700);
                         if (!confirmationClicked) {
-                            const confirmation = Array.from(document.querySelectorAll("button"))
-                                .find(button => {
-                                    if (!isVisible(button) || button.disabled) return false;
-                                    const text = normalizedText(button.textContent).toLowerCase();
-                                    return /^(confirm|create|generate|yes,? create|yes,? generate|확인|생성|만들기)$/.test(text);
-                                });
+                            const confirmation = findGenerationApproval();
                             if (confirmation) {
                                 clickElement(confirmation);
                                 confirmationClicked = true;
+                                reportProgress("approval_confirmed");
                             }
                         }
+                        const generationActive = imageGenerationIsActive();
+                        reportProgress(generationActive ? "generation_active" : "waiting_for_result");
 
                         const assets = currentMediaAssets();
                         const fresh = Array.from(assets.values())
@@ -1397,15 +2064,50 @@ async function handleSubmitFlowRequest(data, socket) {
                             stablePolls = ids === stableIds ? stablePolls + 1 : 1;
                             stableIds = ids;
                             if (stablePolls >= 3) {
+                                reportProgress(isVideo ? "video_ready" : "image_ready");
+                                if (isVideo) {
+                                    if (fresh.length !== 1) throw new Error("Flow returned ambiguous new video results");
+                                    const asset = fresh[0];
+                                    if (asset.editorButton) {
+                                        const fingerprint = browserFingerprint();
+                                        clickElement(asset.editorButton);
+                                        return { flow2apiVideoEditor: true, expectedMediaId: asset.mediaId || "", fingerprint };
+                                    }
+                                    const response = await fetch(asset.url, { credentials: "include" });
+                                    if (!response.ok) throw new Error(`Generated video download failed (${response.status})`);
+                                    const bytes = new Uint8Array(await response.arrayBuffer());
+                                    if (bytes.length < 12 || bytes.length > 10 * 1024 * 1024
+                                        || String.fromCharCode(...bytes.subarray(4, 8)) !== "ftyp") {
+                                        throw new Error("Generated video is not a supported MP4 or exceeds 10MB");
+                                    }
+                                    let binary = "";
+                                    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+                                        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+                                    }
+                                    return {
+                                        http_status: 200,
+                                        response_text: JSON.stringify({
+                                            media: [{
+                                                name: asset.mediaId || `flow-ui-${crypto.randomUUID()}`,
+                                                status: "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+                                                video: { generatedVideo: { encodedVideo: btoa(binary), aspectRatio: rawRequest.aspectRatio, model: rawRequest.videoModelKey, duration: `${asset.duration}s` } },
+                                            }],
+                                            flow2apiTransport: "flow_google_video_ui",
+                                        }),
+                                        response_headers: { "content-type": "application/json" },
+                                        fingerprint: browserFingerprint(),
+                                    };
+                                }
                                 return {
                                     http_status: 200,
                                     response_text: JSON.stringify({
-                                        media: fresh.slice(0, 1).map(asset => ({
+                                        media: fresh.slice(0, 16).map(asset => ({
                                             name: asset.mediaId || "",
                                             image: {
                                                 generatedImage: {
                                                     mediaId: asset.mediaId,
                                                     fifeUrl: asset.url,
+                                                    flow2apiIdentity: asset.identity,
                                                     prompt,
                                                     modelNameType: imageRequest.imageModelName || "",
                                                     aspectRatio: imageRequest.imageAspectRatio || "",
@@ -1414,14 +2116,36 @@ async function handleSubmitFlowRequest(data, socket) {
                                             },
                                         })),
                                         flow2apiTransport: "flow_google_ui",
+                                        flow2apiBaselineIdentities: Array.from(baselineIds),
                                     }),
                                     response_headers: { "content-type": "application/json" },
                                     fingerprint: browserFingerprint(),
                                 };
                             }
+                        } else {
+                            stableIds = "";
+                            stablePolls = 0;
                         }
-                        if (countFailureSignals() > baselineFailureCount) {
-                            throw new Error("Flow agent reported that it could not generate the image");
+                        if (isVideo) {
+                            const failure = newVideoFailure(videoFailureBaseline, readVideoFailures());
+                            if (failure) {
+                                const error = new Error(failure.message);
+                                error.flowVideoFailure = failure;
+                                throw error;
+                            }
+                        } else {
+                            imageFailurePolls = nextImageFailurePollCount(
+                                countFailureSignals() > baselineFailureCount,
+                                generationActive,
+                                imageFailurePolls,
+                            );
+                            // Flow can briefly add failure-like agent prose while it is
+                            // still retrying internally. Only treat it as terminal after
+                            // the active generation control has disappeared and the same
+                            // signal remains visible across several polls.
+                            if (imageFailurePolls >= 5) {
+                                throw new Error("Flow agent reported that it could not generate the image");
+                            }
                         }
                     }
                     throw new Error("Timed out waiting for the image generated by the Flow UI");
@@ -1429,12 +2153,40 @@ async function handleSubmitFlowRequest(data, socket) {
 
                 const parsedRequestUrl = new URL(requestUrl);
                 if (
-                    action === "IMAGE_GENERATION"
-                    && /\/flowMedia:batchGenerateImages$/.test(parsedRequestUrl.pathname)
+                    (action === "IMAGE_GENERATION"
+                    && /\/flowMedia:batchGenerateImages$/.test(parsedRequestUrl.pathname))
+                    || (action === "VIDEO_GENERATION"
+                    && /\/video:batchAsyncGenerateVideo(?:StartImage|Text)$/.test(parsedRequestUrl.pathname))
                 ) {
                     window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__ = true;
                     try {
                         return await submitImageThroughCurrentFlowUi(requestBody || {});
+                    } catch (error) {
+                        // Chrome may serialize rejected injected promises as an empty
+                        // result. Return the actual UI failure inside the page instead.
+                        if (error.flowVideoFailure) {
+                            return {
+                                http_status: 502,
+                                response_text: JSON.stringify({ error: error.flowVideoFailure }),
+                                response_headers: { "content-type": "application/json" },
+                                fingerprint: browserFingerprint(),
+                            };
+                        }
+                        const visible = element => Boolean(element.getBoundingClientRect().width && element.getBoundingClientRect().height);
+                        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], mat-dialog-container'))
+                            .filter(visible).map(element => String(element.textContent || "").replace(/\s+/g, " ").trim().slice(0, 400));
+                        const buttons = Array.from(document.querySelectorAll("button"))
+                            .filter(visible).map(element => String(element.textContent || element.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim())
+                            .filter(Boolean).slice(-16);
+                        const pageText = String(document.body && document.body.innerText || "")
+                            .replace(/\s+/g, " ").trim().slice(0, 1200);
+                        const projectUnavailable = /프로젝트를 찾을 수 없|project not found|couldn't find this project|cannot find this project/i.test(pageText);
+                        return {
+                            http_status: 502,
+                            response_text: JSON.stringify({ error: { message: String(error.message || error) + "; UI: " + JSON.stringify({ dialogs, buttons, projectUnavailable }) } }),
+                            response_headers: { "content-type": "application/json" },
+                            fingerprint: browserFingerprint(),
+                        };
                     } finally {
                         window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__ = false;
                     }
@@ -1524,10 +2276,105 @@ async function handleSubmitFlowRequest(data, socket) {
                     googleApiKey,
                     data.body || {},
                     Math.max(5000, Number(data.timeout_ms || 60000)),
+                    String(data.req_id || ""),
                 ],
             });
+            if (usesCurrentFlowUi) {
+                const pollProgress = async () => {
+                    if (!newTabId) return;
+                    // This heartbeat deliberately runs before the executeScript
+                    // re-entry guard. Chrome can serialize a progress probe behind
+                    // the long-running MAIN-world generation script, but the
+                    // extension worker itself is still alive and owns the request.
+                    sendActiveFlowSubmitHeartbeat(newTabId);
+                    if (progressPollRunning) return;
+                    progressPollRunning = true;
+                    try {
+                        const snapshots = await chrome.scripting.executeScript({
+                            target: { tabId: newTabId },
+                            world: "MAIN",
+                            func: requestId => {
+                                const progress = window.__FLOW2API_BROWSER_SUBMIT_PROGRESS__;
+                                if (!progress || progress.request_id !== requestId) return null;
+                                return {
+                                    phase: String(progress.phase || "active").slice(0, 64),
+                                    updated_at: Number(progress.updated_at || 0),
+                                };
+                            },
+                            args: [String(data.req_id || "")],
+                        });
+                        const progress = snapshots && snapshots[0] && snapshots[0].result;
+                        const updatedAt = Number(progress && progress.updated_at || 0);
+                        if (updatedAt > lastProgressUpdatedAt) {
+                            lastProgressUpdatedAt = updatedAt;
+                            const active = activeFlowSubmitBridges.get(newTabId);
+                            if (active) active.lastPhase = progress.phase;
+                            sendFlowSubmitProgress(data, socket, progress.phase);
+                        }
+                    } catch (error) {
+                        // A navigation or destroyed execution context intentionally
+                        // stops progress. The server-side stall watchdog decides
+                        // whether to fail over to another mapped account.
+                    } finally {
+                        progressPollRunning = false;
+                    }
+                };
+                progressMonitor = setInterval(pollProgress, FLOW_PROGRESS_POLL_INTERVAL_MS);
+                void pollProgress();
+            }
+            const requestedTimeoutMs = Math.max(5000, Number(data.timeout_ms || 60000));
+            const uiExecutionTimeoutMs = usesCurrentFlowUi
+                ? String(data.action || "").toUpperCase() === "VIDEO_GENERATION"
+                    ? Math.min(360000, Math.max(240000, requestedTimeoutMs))
+                    : Math.min(240000, Math.max(180000, requestedTimeoutMs))
+                : requestedTimeoutMs;
+            const hardTimeoutMs = Math.max(
+                45000,
+                uiExecutionTimeoutMs + FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS
+            );
+            const hardTimeoutPromise = new Promise((_, reject) => {
+                hardTimeoutHandle = setTimeout(
+                    () => reject(new Error("Flow browser submit hard timeout")),
+                    hardTimeoutMs
+                );
+            });
+            results = await Promise.race([executionPromise, hardTimeoutPromise]);
+            const editorResult = results && results[0] && results[0].result;
+            if (editorResult && editorResult.flow2apiVideoEditor === true) {
+                const active = activeFlowSubmitBridges.get(newTabId);
+                if (active) active.lastPhase = "video_downloading";
+                sendFlowSubmitProgress(data, socket, "video_downloading");
+                const downloads = await Promise.race([
+                    chrome.scripting.executeScript({
+                        target: { tabId: newTabId }, world: "MAIN",
+                        func: downloadFlowVideoFromEditor,
+                        args: [projectId, editorResult.expectedMediaId, String(data.req_id || "")],
+                    }),
+                    hardTimeoutPromise,
+                ]);
+                const downloaded = downloads && downloads[0];
+                if (downloaded?.error) throw new Error(downloaded.error.message || "Flow original video download failed");
+                const video = downloaded && downloaded.result;
+                if (!video?.encodedVideo || !video.mediaId) throw new Error("Flow original video download returned no MP4");
+                const request = data.body?.requests?.[0] || {};
+                results = [{ result: {
+                    http_status: 200,
+                    response_text: JSON.stringify({
+                        media: [{ name: video.mediaId, status: "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+                            video: { generatedVideo: { encodedVideo: video.encodedVideo, duration: video.duration,
+                                aspectRatio: request.aspectRatio, model: request.videoModelKey } } }],
+                        flow2apiTransport: "flow_google_video_ui",
+                    }),
+                    response_headers: { "content-type": "application/json" },
+                    fingerprint: editorResult.fingerprint,
+                } }];
+            }
         } finally {
-            ignoreFlowAuthorizationCaptureUntil = Date.now() + 500;
+            if (progressMonitor) clearInterval(progressMonitor);
+            if (hardTimeoutHandle) clearTimeout(hardTimeoutHandle);
+            if (!usesCurrentFlowUi) {
+                ignoredFlowAuthorizationTabIds.delete(newTabId);
+            }
         }
 
         const executionResult = results && results[0];
@@ -1542,8 +2389,35 @@ async function handleSubmitFlowRequest(data, socket) {
             throw new Error("Flow browser submit returned no HTTP response");
         }
         let responseText = result.response_text || "";
+        if (
+            usesCurrentFlowUi
+            && result.http_status >= 400
+            && flowUiNeedsUserAction(responseText)
+        ) {
+            preserveTabForUserAction = true;
+            try {
+                await chrome.tabs.update(newTabId, { active: true });
+            } catch (focusError) {
+                console.warn("[Flow2API] Could not reveal the Flow tab requiring user action:", focusError);
+            }
+        }
         if (result.http_status >= 200 && result.http_status < 300) {
-            responseText = await embedCurrentFlowImages(responseText);
+            if (imageValidator) {
+                try {
+                    responseText = await validateCurrentFlowImages(responseText, imageValidator);
+                } catch (validationError) {
+                    if (!validationError.flow2apiReferenceOnly) throw validationError;
+                    responseText = await waitForValidatedFlowImage(
+                        newTabId,
+                        responseText,
+                        imageValidator,
+                        data,
+                        socket,
+                        validationError.flow2apiIgnoredIdentities,
+                    );
+                }
+            }
+            responseText = await embedCurrentFlowImages(responseText, imageValidator?.accepted);
         }
         sendSocketMessage({
             req_id: data.req_id,
@@ -1564,7 +2438,9 @@ async function handleSubmitFlowRequest(data, socket) {
             console.error("[Flow2API] Could not return Flow submit error:", socketError);
         }
     } finally {
-        if (newTabId) {
+        cancelledFlowSubmitRequestIds.delete(String(data.req_id || ""));
+        if (newTabId) activeFlowSubmitBridges.delete(newTabId);
+        if (newTabId && !preserveTabForUserAction) {
             try {
                 await chrome.tabs.remove(newTabId);
                 console.log("[Flow2API] Closed temporary Flow submit tab.");
@@ -1741,12 +2617,14 @@ chrome.runtime.onMessage.addListener((message, sender) => {
         ).catch((error) => {
             console.log("[Flow2API] Could not retain Flow request authorization:", error);
         });
+    } else if (message.type === "flow_submit_progress_bridge") {
+        forwardFlowSubmitProgress(message, sender);
     }
 });
 
 chrome.webRequest.onBeforeSendHeaders.addListener(
     (details) => {
-        if (Date.now() < ignoreFlowAuthorizationCaptureUntil) return;
+        if (ignoredFlowAuthorizationTabIds.has(details.tabId)) return;
         const authorization = (details.requestHeaders || []).find(
             (header) => String(header && header.name || "").toLowerCase() === "authorization"
         );

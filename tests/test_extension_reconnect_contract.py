@@ -13,7 +13,7 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("alarms", manifest["permissions"])
         self.assertGreaterEqual(
             tuple(int(part) for part in manifest["version"].split(".")),
-            (1, 3, 11),
+            (1, 3, 13),
         )
 
     def test_manifest_allows_current_flow_host(self):
@@ -60,11 +60,16 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("flow_request_authorization", capture_script)
         self.assertIn("flow_request_authorization", bridge_script)
         self.assertIn("rememberFlowRequestAuthorization", background)
-        self.assertIn("ignoreFlowAuthorizationCaptureUntil", background)
-        self.assertIn("[FLOW_REQUEST_AUTH_STORAGE_KEY]: null", background)
+        self.assertIn("ignoredFlowAuthorizationTabIds", background)
+        self.assertNotIn("ignoreFlowAuthorizationCaptureUntil", background)
+        self.assertNotIn("[FLOW_REQUEST_AUTH_STORAGE_KEY]: null", background)
         self.assertIn('headers["x-goog-api-key"]', background)
         self.assertIn("readFlowPageAuthContext", background)
         self.assertIn("globals.K21R3e", background)
+        self.assertIn("flowProjectIdFromUrl", background)
+        self.assertIn("findOpenFlowProjectTab", background)
+        self.assertIn("project_id: observedProjectId", background)
+        self.assertIn("url: buildFlowPageUrl(projectId)", background)
         self.assertIn('sha1Hex(`${value} ${origin}`)', background)
         self.assertNotIn('sha1Hex(`${timestamp} ${value} ${origin}`)', background)
         self.assertIn("chrome.storage.session", background)
@@ -84,6 +89,19 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("handleGetSessionCookie(data, socket)", background)
         self.assertIn("sendSocketMessage(payload, socket = ws)", background)
         self.assertIn("connectWS();", background)
+
+    def test_session_refresh_is_not_blocked_by_generation_queue(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn("let generationRequestQueue = Promise.resolve()", background)
+        self.assertIn("let credentialRequestQueue = Promise.resolve()", background)
+        self.assertIn(
+            "credentialRequestQueue = credentialRequestQueue.then(() => handleGetSessionCookie(data, socket))",
+            background,
+        )
+        self.assertIn("generationRequestQueue = generationRequestQueue", background)
+        self.assertIn("return handleSubmitFlowRequest(data, socket)", background)
+        self.assertIn("queuedProgressMonitor", background)
 
     def test_current_flow_image_generation_uses_ui_transport(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
@@ -105,6 +123,81 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("__flow2apiUiContext", background)
         self.assertIn("delete body.__flow2apiUiContext", background)
         self.assertIn("flow_google_ui", background)
+
+    def test_current_flow_submit_reports_liveness_to_the_server(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+        bridge = (REPO_ROOT / "extension" / "auth_bridge.js").read_text()
+
+        self.assertIn('type: "flow_submit_progress"', background)
+        self.assertIn("__FLOW2API_BROWSER_SUBMIT_PROGRESS__", background)
+        self.assertIn("FLOW_PROGRESS_POLL_INTERVAL_MS", background)
+        self.assertIn("FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS", background)
+        self.assertIn('source: "flow2api-submit-progress"', background)
+        self.assertIn("activeFlowSubmitBridges", background)
+        self.assertIn("forwardFlowSubmitProgress(message, sender)", background)
+        self.assertIn('sendFlowSubmitProgress(data, socket, "extension_queued")', background)
+        self.assertIn("sendActiveFlowSubmitHeartbeat(newTabId)", background)
+        self.assertLess(
+            background.index("sendActiveFlowSubmitHeartbeat(newTabId)"),
+            background.index("if (progressPollRunning) return", background.index("sendActiveFlowSubmitHeartbeat(newTabId)")),
+        )
+        self.assertIn("uiExecutionTimeoutMs + FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS", background)
+        self.assertIn('type: "flow_submit_progress_bridge"', bridge)
+        self.assertIn("event.source !== window", bridge)
+        self.assertIn("event.origin !== location.origin", bridge)
+
+    def test_timed_out_flow_submit_can_be_cancelled(self):
+        manifest = json.loads((REPO_ROOT / "extension" / "manifest.json").read_text())
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertGreaterEqual(
+            tuple(int(part) for part in manifest["version"].split(".")),
+            (1, 3, 30),
+        )
+        self.assertIn('data.type === "cancel_flow_request"', background)
+        self.assertIn("cancelFlowSubmitRequest(data)", background)
+        self.assertIn("cancelledFlowSubmitRequestIds", background)
+        self.assertIn("queuedFlowSubmitMonitors", background)
+        self.assertIn("await chrome.tabs.remove(tabIds)", background)
+
+    def test_current_flow_consent_accepts_korean_agree_label(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn("동의(?:함)?", background)
+        self.assertIn('reportProgress("approval_confirmed")', background)
+
+    def test_completed_generation_does_not_treat_enabled_start_button_as_active(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn('button.getAttribute("aria-disabled") === "true"', background)
+        self.assertIn('(disabled && /initiating image generation|이미지 생성 시작/.test(label))', background)
+        self.assertIn('generationActive ? "generation_active" : "waiting_for_result"', background)
+
+    def test_image_result_validation_runs_after_the_page_script_returns(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn("validateCurrentFlowImages(responseText, imageValidator)", background)
+        self.assertIn("fetchCurrentFlowImageFromTab(newTabId, url)", background)
+        self.assertIn("waitForValidatedFlowImage(", background)
+        self.assertIn("flow2apiIdentity: asset.identity", background)
+        self.assertIn("flow2apiBaselineIdentities: Array.from(baselineIds)", background)
+        self.assertIn("const firstBaseline = currentMediaAssets(true)", background)
+        self.assertIn("if (fresh.length)", background)
+        self.assertNotIn("__FLOW2API_IMAGE_VERDICT__", background)
+        self.assertNotIn("__FLOW2API_IMAGE_CANDIDATES__", background)
+
+    def test_user_action_tab_is_revealed_and_preserved(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn("flowUiNeedsUserAction(responseText)", background)
+        self.assertIn("chrome.tabs.update(newTabId, { active: true })", background)
+        self.assertIn("newTabId && !preserveTabForUserAction", background)
+        self.assertIn("projectUnavailable", background)
+
+    def test_native_upload_does_not_require_duplicate_detail_preview_image(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertNotIn("uploaded product image detail preview", background)
 
 
 if __name__ == "__main__":
