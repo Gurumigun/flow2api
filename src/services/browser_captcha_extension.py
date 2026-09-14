@@ -388,7 +388,21 @@ class ExtensionCaptchaService:
             }
             for conn in self.active_connections
         ]
+        now = time.monotonic()
+        active_requests = []
+        for req_id, (future, websocket) in self.pending_requests.items():
+            conn = next((item for item in self.active_connections if item.websocket is websocket), None)
+            activity = self._pending_flow_activity.get(req_id)
+            active_requests.append({
+                "request_id": req_id,
+                "route_key": conn.route_key if conn else "",
+                "phase": activity[1] if activity else "awaiting_result",
+                "heartbeat_age_seconds": round(max(0, now - activity[0]), 1) if activity else None,
+                "phase_age_seconds": round(max(0, now - activity[2]), 1) if activity and len(activity) > 2 else None,
+                "done": future.done(),
+            })
         return {
+            "active_requests": active_requests,
             "connected": bool(routes),
             "connection_count": len(routes),
             "routes": routes,
@@ -866,9 +880,9 @@ class ExtensionCaptchaService:
             version = tuple(int(part) for part in str(extension_version or "").split(".")[:3])
         except ValueError:
             version = ()
-        if (version + (0, 0, 0))[:3] < (1, 3, 30):
+        if (version + (0, 0, 0))[:3] < (1, 3, 39):
             raise ExtensionCaptchaError(
-                "Flow image generation needs Chrome extension 1.3.30+ to continue past uploaded reference cards. Reload the updated Flow2API extension.",
+                "Flow image generation needs Chrome extension 1.3.39+ to isolate each request in a new session and return only completed conversation images. Reload the updated Flow2API extension.",
                 code="extension_reload_required",
             )
 
@@ -878,9 +892,9 @@ class ExtensionCaptchaService:
             version = tuple(int(part) for part in str(extension_version or "").split(".")[:3])
         except ValueError:
             version = ()
-        if (version + (0, 0, 0))[:3] < (1, 3, 31):
+        if (version + (0, 0, 0))[:3] < (1, 3, 40):
             raise ExtensionCaptchaError(
-                "Flow video needs Chrome extension 1.3.31+. Reload the updated Flow2API extension.",
+                "Flow video needs Chrome extension 1.3.40+ for the 15-minute video result wait. Reload the updated Flow2API extension.",
                 code="extension_reload_required",
             )
 

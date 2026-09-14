@@ -112,9 +112,10 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("Nano Banana 2 Lite", background)
         self.assertIn("flow-add-menu-popover-content", background)
         self.assertIn("inputUploads", background)
-        self.assertIn("Flow native upload", background)
+        self.assertIn("Flow reference upload confirmation", background)
+        self.assertIn("uploaded Flow reference", background)
         self.assertIn("HTMLInputElement.prototype.click", background)
-        self.assertIn('parsed.pathname.startsWith("/asb/")', background)
+        self.assertIn('parsed.protocol === "https:"', background)
         self.assertIn('parsed.hostname === "flow-content.google"', background)
         self.assertIn('parsed.searchParams.get("name")', background)
         self.assertIn("embedCurrentFlowImages", background)
@@ -171,7 +172,8 @@ class ExtensionReconnectContractTests(unittest.TestCase):
 
         self.assertIn('button.getAttribute("aria-disabled") === "true"', background)
         self.assertIn('(disabled && /initiating image generation|이미지 생성 시작/.test(label))', background)
-        self.assertIn('generationActive ? "generation_active" : "waiting_for_result"', background)
+        self.assertIn('generationActive ? "generation_active"', background)
+        self.assertIn('`result_wait:o${Number(submission.observed)}', background)
 
     def test_image_result_validation_runs_after_the_page_script_returns(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
