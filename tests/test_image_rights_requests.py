@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 from fastapi import HTTPException
 from src.core.image_rights import image_rights_scope, has_request_image_consent, validate_image_rights_consents
-from src.core.models import GeminiGenerateContentRequest
+from src.core.models import ChatCompletionRequest, GeminiGenerateContentRequest
 from src.services.flow_client import FlowClient
 from src.api import routes
 
@@ -70,6 +70,31 @@ class ConsentTests(unittest.IsolatedAsyncioTestCase):
                 await routes._normalize_gemini_request('gemini-3.1-flash-image-three-four', request(digests))
             self.assertEqual(error.exception.status_code, 400)
 
+    async def test_openai_normalization_accepts_exact_hash_and_rejects_unrelated_hash(self):
+        def openai_request(digests):
+            return ChatCompletionRequest(
+                model='gemini-3.1-flash-image-three-four',
+                messages=[{
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': 'draw a scene'},
+                        {
+                            'type': 'image_url',
+                            'image_url': {
+                                'url': f'data:image/png;base64,{ENCODED}',
+                            },
+                        },
+                    ],
+                }],
+                imageRightsConsents=digests,
+            )
+
+        normalized = await routes._normalize_openai_request(openai_request([DIGEST]))
+        self.assertEqual(normalized.image_rights_consents, (DIGEST,))
+        with self.assertRaises(HTTPException) as error:
+            await routes._normalize_openai_request(openai_request(['0' * 64]))
+        self.assertEqual(error.exception.status_code, 400)
+
     async def test_handler_failure_clears_consent(self):
         class Handler:
             async def handle_generation(self, **kwargs):
@@ -110,6 +135,64 @@ class ConsentTests(unittest.IsolatedAsyncioTestCase):
             await iterator.aclose()
         self.assertTrue(handler.seen)
         self.assertFalse(has_request_image_consent(ENCODED))
+
+    async def test_openai_stream_scopes_and_clears_consent(self):
+        class Handler:
+            async def handle_generation(self, **kwargs):
+                self.seen = has_request_image_consent(ENCODED)
+                yield json.dumps({'error': {'message': 'stop', 'status_code': 400}})
+
+        handler = Handler()
+        normalized = routes.NormalizedGenerationRequest(
+            'test',
+            'prompt',
+            [PNG],
+            image_rights_consents=(DIGEST,),
+        )
+        with patch.object(routes, 'generation_handler', handler):
+            iterator = routes._iterate_openai_stream(normalized)
+            await anext(iterator)
+            await iterator.aclose()
+        self.assertTrue(handler.seen)
+        self.assertFalse(has_request_image_consent(ENCODED))
+
+    async def test_openai_endpoint_passes_consent_to_non_stream_collector(self):
+        from starlette.requests import Request
+
+        raw = Request({
+            'type': 'http',
+            'method': 'POST',
+            'path': '/',
+            'scheme': 'http',
+            'server': ('localhost', 8000),
+            'headers': [],
+            'query_string': b'',
+        })
+        normalized = routes.NormalizedGenerationRequest(
+            'test',
+            'prompt',
+            [PNG],
+            image_rights_consents=(DIGEST,),
+        )
+        request_model = ChatCompletionRequest(
+            model='test',
+            messages=[{'role': 'user', 'content': 'prompt'}],
+        )
+        with (
+            patch.object(routes, '_normalize_openai_request', return_value=normalized),
+            patch.object(
+                routes,
+                '_collect_non_stream_result',
+                new_callable=unittest.mock.AsyncMock,
+                return_value=json.dumps({'choices': []}),
+            ) as collect,
+        ):
+            response = await routes.create_chat_completion(request_model, raw, 'test')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            collect.await_args.kwargs['image_rights_consents'],
+            (DIGEST,),
+        )
 
 if __name__ == '__main__':
     unittest.main()

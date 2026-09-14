@@ -436,18 +436,27 @@ async def _normalize_openai_request(
         images = await _append_openai_reference_images(model, request.messages, images)
         if len(images) != initial_image_count:
             model = _resolve_request_model(request.model, request, images=images)
+        try:
+            image_rights_consents = validate_image_rights_consents(
+                request.imageRightsConsents,
+                images,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         return NormalizedGenerationRequest(
             model=model,
             prompt=prompt,
             images=images,
             messages=request.messages,
             video_media_id=video_media_id,
+            image_rights_consents=image_rights_consents,
         )
 
     if request.contents:
         gemini_request = GeminiGenerateContentRequest(
             contents=_coerce_gemini_contents(request.contents),
             generationConfig=request.generationConfig,
+            imageRightsConsents=request.imageRightsConsents,
         )
         normalized = await _normalize_gemini_request(request.model, gemini_request)
         normalized.messages = request.messages
@@ -730,21 +739,22 @@ async def _iterate_openai_stream(
     normalized: NormalizedGenerationRequest,
     base_url_override: Optional[str] = None,
 ):
-    handler = _ensure_generation_handler()
-    async for chunk in handler.handle_generation(
-        model=normalized.model,
-        prompt=normalized.prompt,
-        images=normalized.images if normalized.images else None,
-        stream=True,
-        base_url_override=base_url_override,
-        video_media_id=normalized.video_media_id,
-    ):
-        if chunk.startswith("data: "):
-            yield chunk
-            continue
+    with image_rights_scope(normalized.image_rights_consents):
+        handler = _ensure_generation_handler()
+        async for chunk in handler.handle_generation(
+            model=normalized.model,
+            prompt=normalized.prompt,
+            images=normalized.images if normalized.images else None,
+            stream=True,
+            base_url_override=base_url_override,
+            video_media_id=normalized.video_media_id,
+        ):
+            if chunk.startswith("data: "):
+                yield chunk
+                continue
 
-        payload = _parse_handler_result(chunk)
-        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            payload = _parse_handler_result(chunk)
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     yield "data: [DONE]\n\n"
 
@@ -892,6 +902,7 @@ async def create_chat_completion(
                 normalized.images,
                 base_url_override=request_base_url,
                 video_media_id=normalized.video_media_id,
+                image_rights_consents=normalized.image_rights_consents,
             )
         )
         return _build_openai_json_response(payload)

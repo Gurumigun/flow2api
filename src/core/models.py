@@ -326,5 +326,7 @@ class ChatCompletionRequest(BaseModel):
     # Gemini extension parameters (from extra_body or top-level)
     generationConfig: Optional[GenerationConfigParam] = None
     contents: Optional[List[Any]] = None  # Gemini native contents
+    # Authenticated caller confirms rights only for these exact input bytes.
+    imageRightsConsents: List[str] = Field(default_factory=list, max_length=16)
 
     model_config = ConfigDict(extra="allow")  # Allow extra fields like extra_body passthrough
