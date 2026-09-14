@@ -1,3 +1,5 @@
+importScripts("video-ui-download.js");
+
 let ws = null;
 let connectPromise = null;
 let connectionGeneration = 0;
@@ -1508,8 +1510,22 @@ async function handleSubmitFlowRequest(data, socket) {
                             return null;
                         }
                     };
-                    const currentMediaAssets = (includePromptImages = false) => {
+                    // Canvas-backed videos have a loaded poster and an editor button,
+                    // but no HTMLVideoElement. Keep the actual button with its asset.
+                    const currentVideoEditorAssets = (includePending = false) => {
                         const assets = new Map();
+                        for (const image of document.querySelectorAll('img')) {
+                            if (!/^(생성된 동영상 썸네일|generated video thumbnail)$/i.test(normalizedText(image.alt))) continue;
+                            if (!includePending && (!image.complete || !image.naturalWidth)) continue;
+                            const button = image.closest('button');
+                            if (!button || !/^(편집기에서 동영상 열기|open video in editor)$/i.test(normalizedText(button.getAttribute('aria-label')))) continue;
+                            const asset = mediaAssetFromUrl(image.currentSrc || image.src);
+                            if (asset) assets.set(asset.identity, { ...asset, editorButton: button });
+                        }
+                        return assets;
+                    };
+                    const currentMediaAssets = (includePromptImages = false) => {
+                        const assets = isVideo ? currentVideoEditorAssets(includePromptImages) : new Map();
                         document.querySelectorAll(isVideo ? "video" : "img").forEach(image => {
                             if (!isVideo && (!image.complete || !image.naturalWidth)) return;
                             if (!isVideo && image.closest("flow-add-menu-popover-content")) return;
@@ -2050,7 +2066,13 @@ async function handleSubmitFlowRequest(data, socket) {
                             if (stablePolls >= 3) {
                                 reportProgress(isVideo ? "video_ready" : "image_ready");
                                 if (isVideo) {
+                                    if (fresh.length !== 1) throw new Error("Flow returned ambiguous new video results");
                                     const asset = fresh[0];
+                                    if (asset.editorButton) {
+                                        const fingerprint = browserFingerprint();
+                                        clickElement(asset.editorButton);
+                                        return { flow2apiVideoEditor: true, expectedMediaId: asset.mediaId || "", fingerprint };
+                                    }
                                     const response = await fetch(asset.url, { credentials: "include" });
                                     if (!response.ok) throw new Error(`Generated video download failed (${response.status})`);
                                     const bytes = new Uint8Array(await response.arrayBuffer());
@@ -2317,6 +2339,36 @@ async function handleSubmitFlowRequest(data, socket) {
                 );
             });
             results = await Promise.race([executionPromise, hardTimeoutPromise]);
+            const editorResult = results && results[0] && results[0].result;
+            if (editorResult && editorResult.flow2apiVideoEditor === true) {
+                const active = activeFlowSubmitBridges.get(newTabId);
+                if (active) active.lastPhase = "video_downloading";
+                sendFlowSubmitProgress(data, socket, "video_downloading");
+                const downloads = await Promise.race([
+                    chrome.scripting.executeScript({
+                        target: { tabId: newTabId }, world: "MAIN",
+                        func: downloadFlowVideoFromEditor,
+                        args: [projectId, editorResult.expectedMediaId, String(data.req_id || "")],
+                    }),
+                    hardTimeoutPromise,
+                ]);
+                const downloaded = downloads && downloads[0];
+                if (downloaded?.error) throw new Error(downloaded.error.message || "Flow original video download failed");
+                const video = downloaded && downloaded.result;
+                if (!video?.encodedVideo || !video.mediaId) throw new Error("Flow original video download returned no MP4");
+                const request = data.body?.requests?.[0] || {};
+                results = [{ result: {
+                    http_status: 200,
+                    response_text: JSON.stringify({
+                        media: [{ name: video.mediaId, status: "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+                            video: { generatedVideo: { encodedVideo: video.encodedVideo, duration: video.duration,
+                                aspectRatio: request.aspectRatio, model: request.videoModelKey } } }],
+                        flow2apiTransport: "flow_google_video_ui",
+                    }),
+                    response_headers: { "content-type": "application/json" },
+                    fingerprint: editorResult.fingerprint,
+                } }];
+            }
         } finally {
             if (progressMonitor) clearInterval(progressMonitor);
             if (hardTimeoutHandle) clearTimeout(hardTimeoutHandle);

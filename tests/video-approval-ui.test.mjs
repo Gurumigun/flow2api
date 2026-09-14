@@ -10,9 +10,9 @@ function choice(text, attributes = {}) {
     cloneNode() { return { textContent: text, querySelectorAll: () => [] }; },
   };
 }
-function find(items, video = true) {
-  return new Function('document', 'isVisible', 'normalizedText', 'isVideo', `${helper}; return findGenerationApproval();`)(
-    { querySelectorAll: () => items }, e => Boolean(e) && !e.hidden, v => String(v || '').replace(/\s+/g, ' ').trim(), video,
+function find(items, video = true, inputUploads = []) {
+  return new Function('document', 'isVisible', 'normalizedText', 'isVideo', 'inputUploads', `${helper}; return findGenerationApproval();`)(
+    { querySelectorAll: () => items }, e => Boolean(e) && !e.hidden, v => String(v || '').replace(/\s+/g, ' ').trim(), video, inputUploads,
   );
 }
 test('video permission selects the single radio approval, never always-approve or deny', () => {

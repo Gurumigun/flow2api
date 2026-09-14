@@ -86,11 +86,11 @@ class NativeVideoResultTests(unittest.IsolatedAsyncioTestCase):
   self.assertNotIn('encodedVideo',result['video_info'])
  async def test_old_extensions_have_actionable_reload_error(self):
   from src.services.browser_captcha_extension import ExtensionCaptchaService, ExtensionCaptchaError
-  for version in ('1.3.13', '1.3.19', '1.3.20', '', 'malformed'):
+  for version in ('1.3.13', '1.3.19', '1.3.20', '1.3.30', '', 'malformed'):
    with self.assertRaises(ExtensionCaptchaError) as caught:
     ExtensionCaptchaService._require_video_ui_version(version)
    self.assertEqual(caught.exception.code,'extension_reload_required')
-  ExtensionCaptchaService._require_video_ui_version('1.3.21')
+  ExtensionCaptchaService._require_video_ui_version('1.3.31')
   ExtensionCaptchaService._require_video_ui_version('1.4')
 
 class VideoBrowserSelectionTests(unittest.IsolatedAsyncioTestCase):
@@ -108,7 +108,7 @@ class VideoBrowserSelectionTests(unittest.IsolatedAsyncioTestCase):
    config.captcha_method='extension'
    self.assertFalse((await balancer._check_extension_route(SimpleNamespace(id=1),require_video_ui=True))[0])
    self.assertTrue((await balancer._check_extension_route(SimpleNamespace(id=1)))[0])
-   service.get_runtime_status=lambda: {'routes':[{'route_key':'google-a','extension_version':'1.3.21'}]}
+   service.get_runtime_status=lambda: {'routes':[{'route_key':'google-a','extension_version':'1.3.31'}]}
    self.assertTrue((await balancer._check_extension_route(SimpleNamespace(id=1),require_video_ui=True))[0])
 
 class NativeVideoUploadTimeoutTests(unittest.IsolatedAsyncioTestCase):

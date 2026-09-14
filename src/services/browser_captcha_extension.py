@@ -878,9 +878,9 @@ class ExtensionCaptchaService:
             version = tuple(int(part) for part in str(extension_version or "").split(".")[:3])
         except ValueError:
             version = ()
-        if (version + (0, 0, 0))[:3] < (1, 3, 21):
+        if (version + (0, 0, 0))[:3] < (1, 3, 31):
             raise ExtensionCaptchaError(
-                "Flow video needs Chrome extension 1.3.21+. Reload the updated Flow2API extension.",
+                "Flow video needs Chrome extension 1.3.31+. Reload the updated Flow2API extension.",
                 code="extension_reload_required",
             )
 
