@@ -85,7 +85,7 @@
 - 默认 `docker-compose.yml` 建议搭配第三方打码（yescaptcha/capmonster/ezcaptcha/capsolver）。
 如需 Docker 内有头打码（browser/personal），请使用下方 `docker-compose.headed.yml`。
 
-- 自动更新st浏览器拓展：[Flow2API-Token-Updater](https://github.com/TheSmallHanCat/Flow2API-Token-Updater)
+- 自动更新 ST 浏览器扩展：使用仓库内的 [`token-updater-extension/`](token-updater-extension/)（v1.1.0+）。它与下方验证码扩展相互独立；当旧的 Labs `session-token` 不再存在时，会通过受限的 Google Cookies 协议交换获取并验证新的 Session Token。
 
 #### Chrome 扩展验证码模式
 

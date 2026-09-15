@@ -2555,11 +2555,54 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     await _verify_plugin_connection_token(authorization)
     plugin_config = await db.get_plugin_config()
 
-    # Extract session token from request
-    session_token = request.get("session_token")
+    request = dict(request or {})
+    session_token = str(request.get("session_token") or "").strip()
+    google_cookies = str(request.get("google_cookies") or "").strip()
+
+    # The standalone token updater originally depended exclusively on the
+    # labs.google NextAuth cookie. Google Flow now redirects to flow.google.com,
+    # so a signed-in Chrome profile may only expose the Google account cookies
+    # needed to complete the same NextAuth OAuth exchange. Keep this path
+    # separate from the WebSocket/browser-auth mode: it still resolves and
+    # persists a real session token before touching the token record.
+    if not session_token and google_cookies:
+        if len(google_cookies) > 128 * 1024:
+            raise HTTPException(status_code=400, detail="google_cookies payload is too large")
+        try:
+            from ..services.protocol_login import protocol_loginer
+
+            login_result = await protocol_loginer.login(
+                google_cookies,
+                proxy=str(request.get("proxy_url") or "").strip() or None,
+                email=str(
+                    request.get("login_account")
+                    or request.get("email")
+                    or ""
+                ).strip() or None,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to exchange Google cookies for session token: {str(exc)}",
+            ) from exc
+
+        session_token = str(login_result.get("session_token") or "").strip()
+        if not login_result.get("success") or not session_token:
+            reason = str(login_result.get("error") or "session token was not returned").strip()
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid Google cookies: {reason}",
+            )
+
+        # Persist the refresh material so future server-side refreshes do not
+        # depend on the extension finding the retired Labs cookie again.
+        request["protocol_mode"] = "protocol"
 
     if not session_token:
-        raise HTTPException(status_code=400, detail="Missing session_token")
+        raise HTTPException(
+            status_code=400,
+            detail="Missing session_token or google_cookies",
+        )
 
     # Step 1: Convert ST to AT to get user info (including email)
     try:

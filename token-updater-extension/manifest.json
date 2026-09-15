@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Flow2API Token Updater",
+  "version": "1.1.0",
+  "description": "Synchronize legacy Labs session tokens or exchange Google cookies through Flow2API.",
+  "permissions": [
+    "alarms",
+    "cookies",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://labs.google/*",
+    "https://flow.google.com/*",
+    "https://google.com/*",
+    "https://*.google.com/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  }
+}

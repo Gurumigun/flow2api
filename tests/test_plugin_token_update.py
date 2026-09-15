@@ -99,6 +99,92 @@ class PluginTokenUpdateTests(unittest.IsolatedAsyncioTestCase):
         )
         manager.set_browser_connection_enabled.assert_not_awaited()
 
+    async def test_google_cookies_are_exchanged_when_labs_cookie_is_missing(self):
+        _, database, manager = self._build_dependencies(
+            expires=datetime.now(timezone.utc) + timedelta(hours=2),
+        )
+        google_cookies = '[{"name":"SID","value":"google-session"}]'
+
+        with (
+            patch.object(admin, "db", database),
+            patch.object(admin, "token_manager", manager),
+            patch(
+                "src.services.protocol_login.protocol_loginer.login",
+                new=AsyncMock(return_value={
+                    "success": True,
+                    "session_token": "protocol-session",
+                }),
+            ) as protocol_login,
+        ):
+            result = await admin.plugin_update_token(
+                {
+                    "google_cookies": google_cookies,
+                    "login_account": "account@example.com",
+                },
+                "Bearer connection-secret",
+            )
+
+        self.assertEqual(result["action"], "updated")
+        protocol_login.assert_awaited_once_with(
+            google_cookies,
+            proxy=None,
+            email="account@example.com",
+        )
+        manager.flow_client.st_to_at.assert_awaited_once_with("protocol-session")
+        self.assertEqual(
+            manager.update_token.await_args.kwargs["st"],
+            "protocol-session",
+        )
+        self.assertEqual(
+            manager.update_token.await_args.kwargs["protocol_mode"],
+            "protocol",
+        )
+        self.assertEqual(
+            manager.update_token.await_args.kwargs["google_cookies"],
+            google_cookies,
+        )
+
+    async def test_invalid_google_cookies_are_rejected_before_st_exchange(self):
+        _, database, manager = self._build_dependencies(
+            expires=datetime.now(timezone.utc) + timedelta(hours=2),
+        )
+
+        with (
+            patch.object(admin, "db", database),
+            patch.object(admin, "token_manager", manager),
+            patch(
+                "src.services.protocol_login.protocol_loginer.login",
+                new=AsyncMock(return_value={
+                    "success": False,
+                    "error": "Google session expired",
+                }),
+            ),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await admin.plugin_update_token(
+                    {"google_cookies": '[{"name":"SID","value":"expired"}]'},
+                    "Bearer connection-secret",
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("Google session expired", raised.exception.detail)
+        manager.flow_client.st_to_at.assert_not_awaited()
+
+    async def test_plugin_update_requires_session_or_google_cookies(self):
+        _, database, manager = self._build_dependencies(
+            expires=datetime.now(timezone.utc) + timedelta(hours=2),
+        )
+
+        with patch.object(admin, "db", database), patch.object(admin, "token_manager", manager):
+            with self.assertRaises(HTTPException) as raised:
+                await admin.plugin_update_token({}, "Bearer connection-secret")
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(
+            raised.exception.detail,
+            "Missing session_token or google_cookies",
+        )
+
 
 class _UnavailableTokenManager:
     def __init__(self, tokens):

@@ -107,7 +107,7 @@
     "更新token时自动启用": "토큰 갱신 시 자동 활성화",
     "当插件更新token时，如果该token被禁用，则自动启用它": "확장프로그램이 토큰을 갱신할 때 비활성 토큰을 자동으로 활성화합니다",
     "使用说明：": "사용 안내:",
-    "安装Chrome扩展后，将连接接口和Token配置到插件中，插件会自动提取Google Labs的cookie并更新到系统": "Chrome 확장프로그램 설치 후 연결 주소와 토큰을 입력하면 Google Labs 쿠키를 자동으로 가져와 시스템에 갱신합니다",
+    "请使用仓库内 token-updater-extension v1.1.0 或更高版本。它会优先提取旧的 Google Labs Session Token；该 Cookie 不存在时，会通过 Google Cookies 协议交换获取新的 Session Token。此插件与 Chrome 扩展打码模式相互独立。": "저장소의 token-updater-extension v1.1.0 이상을 사용하세요. 기존 Google Labs Session Token을 먼저 확인하고, 해당 쿠키가 없으면 Google 쿠키 프로토콜 교환으로 새 Session Token을 발급합니다. 이 확장프로그램은 Chrome CAPTCHA 확장 모드와 별개입니다.",
     "验证码配置": "CAPTCHA 설정",
     "打码方式": "CAPTCHA 처리 방식",
     "YesCaptcha打码": "YesCaptcha",
