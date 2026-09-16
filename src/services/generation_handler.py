@@ -1973,6 +1973,33 @@ class GenerationHandler:
                         token_image_concurrency=token.image_concurrency,
                         progress_callback=_image_progress_callback,
                     )
+                    # Flow occasionally returns HTTP 200 with an empty or
+                    # incomplete media envelope when the UI loses the result
+                    # card during navigation. Treat that as a recoverable
+                    # browser-route failure so the request can fail over to a
+                    # fresh account instead of surfacing a generic 502 after
+                    # spending the entire retry budget on a bad result.
+                    media_items = result.get("media") if isinstance(result, dict) else None
+                    first_image = (
+                        media_items[0].get("image")
+                        if isinstance(media_items, list)
+                        and media_items
+                        and isinstance(media_items[0], dict)
+                        else None
+                    )
+                    generated_image = (
+                        first_image.get("generatedImage")
+                        if isinstance(first_image, dict)
+                        else None
+                    )
+                    if config.captcha_method == "extension" and (
+                        not isinstance(generated_image, dict)
+                        or not str(generated_image.get("fifeUrl") or generated_image.get("encodedImage") or "").strip()
+                    ):
+                        raise ExtensionCaptchaError(
+                            "Flow returned an empty or incomplete image result",
+                            code="flow_image_empty_result",
+                        )
                     if image_trace is not None:
                         image_trace["generate_api_ms"] = (
                             int(image_trace.get("generate_api_ms") or 0)
@@ -2016,6 +2043,7 @@ class GenerationHandler:
                     slow_failure_codes = {
                         "extension_flow_stalled",
                         "extension_flow_timeout",
+                        "flow_image_empty_result",
                         "flow_image_agent_reported_failure",
                     }
                     if error_code in slow_failure_codes:
@@ -2028,6 +2056,7 @@ class GenerationHandler:
                             "extension_flow_stalled",
                             "extension_flow_timeout",
                             "extension_flow_transport_failed",
+                            "flow_image_empty_result",
                             "extension_user_action_required",
                             "flow_image_agent_reported_failure",
                         }
