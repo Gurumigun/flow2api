@@ -817,6 +817,25 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             0,
         )
 
+    async def test_stalled_extension_route_cooldown_backoffs_until_success(self):
+        token = Token(id=7, st="st-7", at="at-7", email="stalled@example.com")
+        balancer = LoadBalancer(_TokenManagerStub([token]))
+
+        first = await balancer.record_extension_transport_failure(token.id)
+        second = await balancer.record_extension_transport_failure(token.id)
+        third = await balancer.record_extension_transport_failure(token.id)
+
+        self.assertEqual((first, second, third), (120.0, 240.0, 480.0))
+        await balancer.record_extension_transport_success(token.id)
+        self.assertEqual(
+            await balancer.get_extension_transport_cooldown_remaining(token.id),
+            0,
+        )
+        self.assertEqual(
+            await balancer.record_extension_transport_failure(token.id),
+            120.0,
+        )
+
 
 class RecaptchaRetryBudgetTests(unittest.TestCase):
     def setUp(self):

@@ -30,6 +30,11 @@ class LoadBalancer:
         self._rr_lock = asyncio.Lock()
         self._captcha_circuit_lock = asyncio.Lock()
         self._extension_transport_cooldown_until: Dict[int, float] = {}
+        # Keep repeatedly stalled extension routes out of rotation for
+        # progressively longer windows. A fixed cooldown lets a broken Chrome
+        # profile re-enter the pool every time it becomes eligible and can
+        # create a noisy retry loop during a Flow outage.
+        self._extension_transport_failure_streak: Dict[int, int] = {}
         self._extension_transport_cooldown_lock = asyncio.Lock()
 
     @staticmethod
@@ -173,17 +178,23 @@ class LoadBalancer:
             return remaining
 
     async def record_extension_transport_failure(self, token_id: int) -> float:
-        cooldown = float(config.extension_stall_cooldown_seconds)
+        base_cooldown = float(config.extension_stall_cooldown_seconds)
         async with self._extension_transport_cooldown_lock:
+            streak = self._extension_transport_failure_streak.get(token_id, 0) + 1
+            self._extension_transport_failure_streak[token_id] = streak
+            multiplier = 2 ** min(streak - 1, 3)
+            cooldown = min(1800.0, base_cooldown * multiplier)
             self._extension_transport_cooldown_until[token_id] = time.monotonic() + cooldown
         debug_logger.log_warning(
-            f"[LOAD_BALANCER] Token {token_id} extension route cooling for {cooldown:.0f}s"
+            f"[LOAD_BALANCER] Token {token_id} extension route cooling for "
+            f"{cooldown:.0f}s (failure_streak={streak})"
         )
         return cooldown
 
     async def record_extension_transport_success(self, token_id: int) -> None:
         async with self._extension_transport_cooldown_lock:
             self._extension_transport_cooldown_until.pop(token_id, None)
+            self._extension_transport_failure_streak.pop(token_id, None)
 
     async def _add_pending(self, token_id: int, for_image_generation: bool, for_video_generation: bool):
         async with self._pending_lock:
