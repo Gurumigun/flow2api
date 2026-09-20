@@ -7,7 +7,7 @@ test('new session is required and its old results must disappear before a reques
  for(const scenario of ['success','missing-button','old-session']){
   let clicked=false;
   const button={getAttribute:()=> '새로운 세션 시작'};
-  const document={querySelectorAll:(selector)=>selector.startsWith('button')?(scenario==='missing-button'?[]:[button]):selector==='img'?(!clicked||scenario==='old-session'?[{alt:'Option 1'}]:[]):[{textContent:clicked&&scenario!=='old-session'?'제목 없는 세션':'기존 대화'}]};
+  const document={querySelectorAll:(selector)=>selector.startsWith('button')||selector.includes('[role="button"]')?(scenario==='missing-button'?[]:[button]):selector==='img'?(!clicked||scenario==='old-session'?[{alt:'Option 1'}]:[]):[{textContent:clicked&&scenario!=='old-session'?'제목 없는 세션':'기존 대화'}]};
   const context={isVideo:false,document,isVisible:()=>true,normalizedText:v=>String(v||'').trim(),clickElement:()=>{clicked=true;},waitFor:async(probe,_ms,label)=>{const result=probe();if(!result)throw Error(label);return result;},reportProgress:()=>{}};
   const run=()=>new Function(...Object.keys(context),`return (async()=>{${start}})()`)(...Object.values(context));
   if(scenario==='success')await run();else await assert.rejects(run,/Flow/);
@@ -17,7 +17,7 @@ test('session reset also accepts Flow title-based English controls', async()=>{
  let clicked = false;
  const button = {getAttribute: name => name === 'title' ? 'New conversation' : '', textContent: ''};
  const document = {
-  querySelectorAll: selector => selector.startsWith('button') ? [button]
+   querySelectorAll: selector => selector.startsWith('button') || selector.includes('[role="button"]') ? [button]
    : selector === 'img' ? (clicked ? [] : [{alt:'Option 1'}])
    : [{textContent: clicked ? 'New conversation' : 'Existing conversation'}],
  };

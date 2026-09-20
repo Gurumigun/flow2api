@@ -1702,7 +1702,7 @@ async function handleSubmitFlowRequest(data, socket) {
                     // session mixes old scripts and unrelated projects into new art.
                     if (!isVideo) {
                         const newSession = await waitFor(
-                            () => Array.from(document.querySelectorAll("button"))
+                            () => Array.from(document.querySelectorAll("button, [role=\"button\"]"))
                                 .find(button => isVisible(button) && /(?:새로운 세션 시작|새 세션 시작|새로운 세션|새 세션|start (?:a )?new session|new session|new conversation)/i.test(
                                     normalizedText([
                                         button.getAttribute("aria-label"),
@@ -1716,7 +1716,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         clickElement(newSession);
                         await waitFor(
                             () => Array.from(document.querySelectorAll('h2, [role="heading"]'))
-                                .some(heading => /^(제목 없는 세션|새 세션|새로운 세션|untitled session|new session|new conversation)$/i.test(normalizedText(heading.textContent)))
+                                .some(heading => /(?:제목 없는 세션|제목 없음|새 세션|새로운 세션|untitled|new session|new conversation)/i.test(normalizedText(heading.textContent)))
                                 && !Array.from(document.querySelectorAll('img')).some(image => /^(?:option|옵션)\s*\d+$/i.test(normalizedText(image.alt))),
                             10000,
                             "empty Flow image session"
