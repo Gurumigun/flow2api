@@ -1703,8 +1703,12 @@ async function handleSubmitFlowRequest(data, socket) {
                     if (!isVideo) {
                         const newSession = await waitFor(
                             () => Array.from(document.querySelectorAll("button"))
-                                .find(button => isVisible(button) && /^(새로운 세션 시작|start (?:a )?new session)$/i.test(
-                                    normalizedText(button.getAttribute("aria-label") || button.textContent)
+                                .find(button => isVisible(button) && /(?:새로운 세션 시작|새 세션 시작|새로운 세션|새 세션|start (?:a )?new session|new session|new conversation)/i.test(
+                                    normalizedText([
+                                        button.getAttribute("aria-label"),
+                                        button.getAttribute("title"),
+                                        button.textContent,
+                                    ].filter(Boolean).join(" "))
                                 )),
                             10000,
                             "Flow new session button"
@@ -1712,7 +1716,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         clickElement(newSession);
                         await waitFor(
                             () => Array.from(document.querySelectorAll('h2, [role="heading"]'))
-                                .some(heading => /^(제목 없는 세션|untitled session)$/i.test(normalizedText(heading.textContent)))
+                                .some(heading => /^(제목 없는 세션|새 세션|새로운 세션|untitled session|new session|new conversation)$/i.test(normalizedText(heading.textContent)))
                                 && !Array.from(document.querySelectorAll('img')).some(image => /^(?:option|옵션)\s*\d+$/i.test(normalizedText(image.alt))),
                             10000,
                             "empty Flow image session"

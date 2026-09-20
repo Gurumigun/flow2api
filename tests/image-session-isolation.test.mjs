@@ -13,6 +13,23 @@ test('new session is required and its old results must disappear before a reques
   if(scenario==='success')await run();else await assert.rejects(run,/Flow/);
  }
 });
+test('session reset also accepts Flow title-based English controls', async()=>{
+ let clicked = false;
+ const button = {getAttribute: name => name === 'title' ? 'New conversation' : '', textContent: ''};
+ const document = {
+  querySelectorAll: selector => selector.startsWith('button') ? [button]
+   : selector === 'img' ? (clicked ? [] : [{alt:'Option 1'}])
+   : [{textContent: clicked ? 'New conversation' : 'Existing conversation'}],
+ };
+ const context = {
+  isVideo:false, document, isVisible:()=>true, normalizedText:v=>String(v||'').trim(),
+  clickElement:()=>{clicked=true;},
+  waitFor:async probe=>{const result=probe();if(!result)throw Error('reset not detected');return result;},
+  reportProgress:()=>{},
+ };
+ await new Function(...Object.keys(context),`return (async()=>{${start}})()`)(...Object.values(context));
+ assert.equal(clicked, true);
+});
 test('late gallery tiles cannot be accepted even after a clean session has generated a result',()=>{
  const button={getAttribute:()=> '편집기에서 이미지 열기'};
  const img=(src,alt,hasButton)=>({src,alt,complete:true,naturalWidth:900,closest:s=>s.startsWith('button')&&hasButton?button:null});
