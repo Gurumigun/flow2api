@@ -859,6 +859,16 @@ class ExtensionCaptchaService:
                 "Flow project is unavailable for the mapped Chrome account",
                 code="extension_project_unavailable",
             )
+        if "Flow new session button" in message:
+            route_error = (
+                "Flow 새 세션 제어를 찾을 수 없습니다. 이 Chrome 프로필의 로그인과 "
+                "Flow 프로젝트 접근 상태를 확인한 뒤 확장을 새로고침하세요."
+            )
+            self._video_ui_blocked_routes[route_key] = route_error
+            raise ExtensionCaptchaError(
+                route_error,
+                code="extension_user_action_required",
+            )
         if "이 이미지를 사용할 권리" in dialogs:
             raise ExtensionCaptchaError(
                 "Flow에서 이 상품 사진을 사용할 권리 확인이 필요합니다. "
@@ -880,9 +890,9 @@ class ExtensionCaptchaService:
             version = tuple(int(part) for part in str(extension_version or "").split(".")[:3])
         except ValueError:
             version = ()
-        if (version + (0, 0, 0))[:3] < (1, 3, 39):
+        if (version + (0, 0, 0))[:3] < (1, 3, 41):
             raise ExtensionCaptchaError(
-                "Flow image generation needs Chrome extension 1.3.39+ to isolate each request in a new session and return only completed conversation images. Reload the updated Flow2API extension.",
+                "Flow image generation needs Chrome extension 1.3.41+ to isolate each request and recover same-origin Flow image results. Reload the updated Flow2API extension.",
                 code="extension_reload_required",
             )
 

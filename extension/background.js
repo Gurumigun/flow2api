@@ -639,14 +639,20 @@ async function connectWS() {
 function isCurrentFlowImageUrl(rawUrl) {
     try {
         const parsed = new URL(String(rawUrl || ""));
+        const isFlowPageBlob = (
+            parsed.protocol === "blob:"
+            && parsed.origin === "https://flow.google.com"
+        );
         // Conversation images can use signed paths beyond the legacy /asb/
-        // format. Request/session isolation happens before this download guard.
-        return parsed.protocol === "https:" && (
+        // format, and the current UI can expose a same-origin blob while the
+        // result card is mounted. Request/session isolation happens before
+        // this download guard.
+        return isFlowPageBlob || (parsed.protocol === "https:" && (
             parsed.hostname === "flow.google.com"
             || parsed.hostname === "flow-content.google"
             || parsed.hostname === "lh3.google.com"
             || /(^|\.)googleusercontent\.com$/.test(parsed.hostname)
-        );
+        ));
     } catch (_) {
         return false;
     }
@@ -950,7 +956,8 @@ async function readCurrentFlowImageCandidates(tabId, expectedRequestId) {
                     ) || (
                         parsed.hostname === "lh3.google.com" && parsed.pathname.startsWith("/rd-asb/")
                     );
-                    if (!mediaId && !isCurrentFlowAsset
+                    const isLocalFlowBlob = parsed.protocol === "blob:" && parsed.origin === location.origin;
+                    if (!mediaId && !isCurrentFlowAsset && !isLocalFlowBlob
                         && !(parsed.protocol === "https:" && isGoogleImageHost)) return;
                     const canonicalUrl = parsed.toString().replace(
                         /=s\d+(?:-[a-z0-9-]+)?(?=$|[?#])/i,
@@ -1491,8 +1498,8 @@ async function handleSubmitFlowRequest(data, socket) {
                                 parsed.hostname === "lh3.google.com"
                                 && parsed.pathname.startsWith("/rd-asb/")
                             );
-                            const isLocalVideoBlob = isVideo && parsed.protocol === "blob:" && parsed.origin === location.origin;
-                            if (!mediaId && !isCurrentFlowAsset && !isLocalVideoBlob
+                            const isLocalFlowBlob = parsed.protocol === "blob:" && parsed.origin === location.origin;
+                            if (!mediaId && !isCurrentFlowAsset && !isLocalFlowBlob
                                 && !(!isVideo && parsed.protocol === "https:" && isGoogleImageHost)) return null;
 
                             const canonicalUrl = parsed.toString().replace(

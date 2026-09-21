@@ -66,7 +66,9 @@ class FlowUiDiagnosticsTests(unittest.TestCase):
             ExtensionCaptchaService._require_image_ui_version("1.3.23")
         with self.assertRaises(ExtensionCaptchaError):
             ExtensionCaptchaService._require_image_ui_version("1.3.30")
-        ExtensionCaptchaService._require_image_ui_version("1.3.39")
+        with self.assertRaises(ExtensionCaptchaError):
+            ExtensionCaptchaService._require_image_ui_version("1.3.40")
+        ExtensionCaptchaService._require_image_ui_version("1.3.41")
 
     def test_missing_project_has_a_specific_recovery_code(self):
         from src.services.browser_captcha_extension import ExtensionCaptchaService
@@ -105,6 +107,28 @@ class FlowUiDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "extension_user_action_required")
         self.assertIn("google-h", service._video_ui_blocked_routes)
+
+    def test_missing_new_session_control_blocks_the_route(self):
+        from src.services.browser_captcha_extension import ExtensionCaptchaService
+
+        service = ExtensionCaptchaService(None)
+        response = json.dumps({
+            "error": {
+                "message": (
+                    "Timed out waiting for Flow new session button; UI: "
+                    + json.dumps({
+                        "dialogs": [],
+                        "buttons": ["Google Flow 사용해 보기", "시작하기"],
+                        "projectUnavailable": False,
+                    })
+                ),
+            },
+        })
+        with self.assertRaises(ExtensionCaptchaError) as caught:
+            service._check_flow_ui_result("google-c", response)
+
+        self.assertEqual(caught.exception.code, "extension_user_action_required")
+        self.assertIn("google-c", service._video_ui_blocked_routes)
 
     def test_generic_image_agent_failure_is_retryable_on_another_route(self):
         from src.services.browser_captcha_extension import ExtensionCaptchaService
