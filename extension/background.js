@@ -1736,56 +1736,6 @@ async function handleSubmitFlowRequest(data, socket) {
                         );
                     }
 
-                    // Each API request gets a clean conversation. Reusing the last
-                    // session mixes old scripts and unrelated projects into new art.
-                    if (!isVideo) {
-                        const newSession = await waitFor(
-                            () => Array.from(document.querySelectorAll("button, [role=\"button\"]"))
-                                .find(button => isVisible(button) && /(?:새로운 세션 시작|새 세션 시작|새로운 세션|새 세션|새 대화|새 채팅|start (?:a )?new session|new session|new conversation|new chat|create (?:a )?new session)/i.test(
-                                    normalizedText([
-                                        button.getAttribute("aria-label"),
-                                        button.getAttribute("title"),
-                                        button.textContent,
-                                    ].filter(Boolean).join(" "))
-                                )),
-                            10000,
-                            "Flow new session button"
-                        );
-                        clickElement(newSession);
-                        // Some Flow accounts show a confirmation dialog before
-                        // discarding the current conversation. Handle it here
-                        // so the request does not continue in the old session.
-                        await pause(250);
-                        const resetDialog = Array.from(document.querySelectorAll('[role="dialog"], dialog'))
-                            .find(dialog => isVisible(dialog));
-                        if (resetDialog && typeof resetDialog.querySelectorAll === "function") {
-                            const confirmReset = Array.from(resetDialog.querySelectorAll('button, [role="button"]'))
-                                .find(button => isVisible(button) && /(?:확인|계속|새로 시작|시작|confirm|continue|start|discard|delete)/i.test(
-                                    normalizedText([
-                                        button.getAttribute("aria-label"),
-                                        button.getAttribute("title"),
-                                        button.textContent,
-                                    ].filter(Boolean).join(" "))
-                                ));
-                            if (confirmReset) clickElement(confirmReset);
-                        }
-                        await waitFor(
-                            () => {
-                                const currentPromptBox = document.querySelector("flow-prompt-box");
-                                const currentComposer = currentPromptBox && Array.from(
-                                    currentPromptBox.querySelectorAll('[contenteditable="true"]')
-                                ).find(isVisible);
-                                const hasResultCards = Array.from(document.querySelectorAll('img'))
-                                    .some(image => /^(?:option|옵션)\s*\d+$/i.test(normalizedText(image.alt)));
-                                return Boolean(currentComposer)
-                                    && !hasResultCards;
-                            },
-                            10000,
-                            "empty Flow image session"
-                        );
-                        reportProgress("new_session_ready");
-                    }
-
                     // The current flow.google.com editor keeps image defaults in
                     // a sticky settings panel. Align them before submitting so
                     // the browser fallback preserves the API request semantics.

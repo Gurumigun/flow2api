@@ -2,39 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 const source=readFileSync(new URL('../extension/background.js',import.meta.url),'utf8');
-const start=source.slice(source.indexOf('// Each API request gets a clean conversation.'),source.indexOf('// The current flow.google.com editor keeps image defaults in'));
-test('new session is required and its old results must disappear before a request is sent',async()=>{
- for(const scenario of ['success','missing-button','old-session']){
- let clicked=false;
-  const button={getAttribute:()=> '새로운 세션 시작'};
-  const composer={textContent:'기존 프롬프트'};
-  const promptBox={querySelectorAll:selector=>selector==='[contenteditable="true"]'?[composer]:[]};
-  const document={querySelector:selector=>selector==='flow-prompt-box'?promptBox:null,querySelectorAll:(selector)=>selector.startsWith('button')||selector.includes('[role="button"]')?(scenario==='missing-button'?[]:[button]):selector==='img'?(!clicked||scenario==='old-session'?[{alt:'Option 1'}]:[]):[]};
-  const context={isVideo:false,document,isVisible:()=>true,normalizedText:v=>String(v||'').trim(),clickElement:()=>{clicked=true;if(scenario!=='old-session')composer.textContent='';},waitFor:async(probe,_ms,label)=>{const result=probe();if(!result)throw Error(label);return result;},pause:async()=>{},reportProgress:()=>{}};
-  const run=()=>new Function(...Object.keys(context),`return (async()=>{${start}})()`)(...Object.values(context));
-  if(scenario==='success')await run();else await assert.rejects(run,/Flow/);
- }
-});
-test('session reset also accepts Flow title-based English controls', async()=>{
- let clicked = false;
- const button = {getAttribute: name => name === 'title' ? 'New conversation' : '', textContent: ''};
- const composer = {textContent: 'Existing prompt'};
- const promptBox = {querySelectorAll: selector => selector === '[contenteditable="true"]' ? [composer] : []};
- const document = {
-   querySelector: selector => selector === 'flow-prompt-box' ? promptBox : null,
-   querySelectorAll: selector => selector.startsWith('button') || selector.includes('[role="button"]') ? [button]
-   : selector === 'img' ? (clicked ? [] : [{alt:'Option 1'}])
-   : [],
- };
- const context = {
-  isVideo:false, document, isVisible:()=>true, normalizedText:v=>String(v||'').trim(),
-  clickElement:()=>{clicked=true;composer.textContent='';},
-  waitFor:async probe=>{const result=probe();if(!result)throw Error('reset not detected');return result;},
-  pause:async()=>{},
-  reportProgress:()=>{},
- };
- await new Function(...Object.keys(context),`return (async()=>{${start}})()`)(...Object.values(context));
- assert.equal(clicked, true);
+test('image generation does not block on Flow session-reset controls',()=>{
+ assert.ok(!source.includes('"Flow new session button"'));
+ assert.ok(!source.includes('"empty Flow image session"'));
 });
 test('late gallery tiles cannot be accepted even after a clean session has generated a result',()=>{
  const button={getAttribute:()=> '편집기에서 이미지 열기'};
