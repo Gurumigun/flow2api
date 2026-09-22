@@ -184,6 +184,15 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("Math.hypot(dx, dy)", background)
         self.assertIn("Flow did not acknowledge submit", background)
 
+    def test_image_submit_can_dispatch_a_trusted_chrome_click(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+        manifest = (REPO_ROOT / "extension" / "manifest.json").read_text()
+
+        self.assertIn('"debugger"', manifest)
+        self.assertIn('chrome.debugger.attach(target, "1.3"', background)
+        self.assertIn('"Input.dispatchMouseEvent"', background)
+        self.assertIn('reportProgress(`trusted_submit:${trustedX}:${trustedY}`)', background)
+
     def test_image_result_validation_runs_after_the_page_script_returns(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
 

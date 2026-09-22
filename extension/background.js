@@ -1180,6 +1180,39 @@ function sendFlowSubmitProgress(data, socket, phase) {
     }, socket);
 }
 
+function dispatchTrustedFlowClick(tabId, x, y) {
+    const target = { tabId: Number(tabId) };
+    const sendCommand = (method, params) => new Promise((resolve, reject) => {
+        chrome.debugger.sendCommand(target, method, params, () => {
+            const error = chrome.runtime.lastError;
+            if (error) reject(new Error(error.message));
+            else resolve();
+        });
+    });
+    return new Promise((resolve, reject) => {
+        chrome.debugger.attach(target, "1.3", async () => {
+            const attachError = chrome.runtime.lastError;
+            if (attachError) {
+                reject(new Error(attachError.message));
+                return;
+            }
+            try {
+                await sendCommand("Input.dispatchMouseEvent", {
+                    type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1,
+                });
+                await sendCommand("Input.dispatchMouseEvent", {
+                    type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1,
+                });
+                resolve();
+            } catch (error) {
+                reject(error);
+            } finally {
+                chrome.debugger.detach(target, () => void chrome.runtime.lastError);
+            }
+        });
+    });
+}
+
 function forwardFlowSubmitProgress(message, sender) {
     const tabId = Number(sender && sender.tab && sender.tab.id);
     const active = activeFlowSubmitBridges.get(tabId);
@@ -1200,6 +1233,15 @@ function forwardFlowSubmitProgress(message, sender) {
     active.lastUpdatedAt = updatedAt;
     active.lastPhase = phase;
     sendFlowSubmitProgress(active.data, active.socket, phase);
+    const trustedSubmit = phase.match(/^trusted_submit:(\d{1,5}):(\d{1,5})$/);
+    if (trustedSubmit) {
+        const x = Number(trustedSubmit[1]);
+        const y = Number(trustedSubmit[2]);
+        dispatchTrustedFlowClick(tabId, x, y).catch(error => {
+            console.warn("[Flow2API] Trusted Flow submit click failed:", error);
+            sendFlowSubmitProgress(active.data, active.socket, "trusted_submit_failed");
+        });
+    }
 }
 
 function sendActiveFlowSubmitHeartbeat(tabId) {
@@ -2176,6 +2218,13 @@ async function handleSubmitFlowRequest(data, socket) {
                         }
                         reportProgress("submit_enter_retry");
                         submissionAccepted = await waitForSubmissionAcceptance(2000);
+                    }
+                    if (!submissionAccepted) {
+                        const rect = submitButton.getBoundingClientRect();
+                        const trustedX = Math.max(0, Math.round(rect.left + rect.width / 2));
+                        const trustedY = Math.max(0, Math.round(rect.top + rect.height / 2));
+                        reportProgress(`trusted_submit:${trustedX}:${trustedY}`);
+                        submissionAccepted = await waitForSubmissionAcceptance(4000);
                     }
                     if (!submissionAccepted) {
                         const composerRect = composer.getBoundingClientRect();
