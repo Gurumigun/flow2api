@@ -190,6 +190,9 @@ class ExtensionReconnectContractTests(unittest.TestCase):
 
         self.assertIn('"debugger"', manifest)
         self.assertIn('chrome.debugger.attach(target, "1.3"', background)
+        self.assertIn('"Page.bringToFront"', background)
+        self.assertIn('"Input.dispatchKeyEvent"', background)
+        self.assertIn('phase === "trusted_enter"', background)
         self.assertIn('"Input.dispatchMouseEvent"', background)
         self.assertIn('reportProgress(`trusted_submit:${trustedX}:${trustedY}`)', background)
 

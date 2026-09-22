@@ -1197,6 +1197,10 @@ function dispatchTrustedFlowClick(tabId, x, y) {
                 return;
             }
             try {
+                await sendCommand("Page.bringToFront", {});
+                await sendCommand("Input.dispatchMouseEvent", {
+                    type: "mouseMoved", x, y, button: "none", buttons: 0,
+                });
                 await sendCommand("Input.dispatchMouseEvent", {
                     type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1,
                 });
@@ -1210,6 +1214,72 @@ function dispatchTrustedFlowClick(tabId, x, y) {
                 chrome.debugger.detach(target, () => void chrome.runtime.lastError);
             }
         });
+    });
+}
+
+function dispatchTrustedFlowEnter(tabId) {
+    const target = { tabId: Number(tabId) };
+    const sendCommand = (method, params) => new Promise((resolve, reject) => {
+        chrome.debugger.sendCommand(target, method, params, () => {
+            const error = chrome.runtime.lastError;
+            if (error) reject(new Error(error.message));
+            else resolve();
+        });
+    });
+    return new Promise((resolve, reject) => {
+        chrome.debugger.attach(target, "1.3", async () => {
+            const attachError = chrome.runtime.lastError;
+            if (attachError) {
+                reject(new Error(attachError.message));
+                return;
+            }
+            try {
+                await sendCommand("Page.bringToFront", {});
+                await sendCommand("Input.dispatchKeyEvent", {
+                    type: "rawKeyDown", key: "Enter", code: "Enter",
+                    windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+                });
+                await sendCommand("Input.dispatchKeyEvent", {
+                    type: "char", key: "Enter", code: "Enter", text: "\r",
+                    unmodifiedText: "\r", windowsVirtualKeyCode: 13,
+                    nativeVirtualKeyCode: 13,
+                });
+                await sendCommand("Input.dispatchKeyEvent", {
+                    type: "keyUp", key: "Enter", code: "Enter",
+                    windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+                });
+                resolve();
+            } catch (error) {
+                reject(error);
+            } finally {
+                chrome.debugger.detach(target, () => void chrome.runtime.lastError);
+            }
+        });
+    });
+}
+
+function recordTrustedSubmitResult(tabId, requestId, operation, ok, error = "") {
+    return chrome.scripting.executeScript({
+        target: { tabId: Number(tabId) },
+        world: "MAIN",
+        args: [
+            String(requestId || ""), String(operation || "unknown"),
+            Boolean(ok), String(error || "").slice(0, 120),
+        ],
+        func: (expectedRequestId, operationName, succeeded, message) => {
+            const previous = window.__FLOW2API_TRUSTED_SUBMIT_RESULT__;
+            const results = previous?.requestId === expectedRequestId
+                ? { ...(previous.results || {}) }
+                : {};
+            results[operationName] = {
+                ok: succeeded,
+                error: message,
+            };
+            window.__FLOW2API_TRUSTED_SUBMIT_RESULT__ = {
+                requestId: expectedRequestId,
+                results,
+            };
+        },
     });
 }
 
@@ -1237,10 +1307,23 @@ function forwardFlowSubmitProgress(message, sender) {
     if (trustedSubmit) {
         const x = Number(trustedSubmit[1]);
         const y = Number(trustedSubmit[2]);
-        dispatchTrustedFlowClick(tabId, x, y).catch(error => {
-            console.warn("[Flow2API] Trusted Flow submit click failed:", error);
-            sendFlowSubmitProgress(active.data, active.socket, "trusted_submit_failed");
-        });
+        dispatchTrustedFlowClick(tabId, x, y)
+            .then(() => recordTrustedSubmitResult(tabId, requestId, "click", true))
+            .catch(error => {
+                console.warn("[Flow2API] Trusted Flow submit click failed:", error);
+                recordTrustedSubmitResult(tabId, requestId, "click", false, error?.message).catch(() => {});
+                sendFlowSubmitProgress(active.data, active.socket, "trusted_submit_failed");
+            });
+        return;
+    }
+    if (phase === "trusted_enter") {
+        dispatchTrustedFlowEnter(tabId)
+            .then(() => recordTrustedSubmitResult(tabId, requestId, "enter", true))
+            .catch(error => {
+                console.warn("[Flow2API] Trusted Flow submit Enter failed:", error);
+                recordTrustedSubmitResult(tabId, requestId, "enter", false, error?.message).catch(() => {});
+                sendFlowSubmitProgress(active.data, active.socket, "trusted_enter_failed");
+            });
     }
 }
 
@@ -2223,7 +2306,13 @@ async function handleSubmitFlowRequest(data, socket) {
                         const rect = submitButton.getBoundingClientRect();
                         const trustedX = Math.max(0, Math.round(rect.left + rect.width / 2));
                         const trustedY = Math.max(0, Math.round(rect.top + rect.height / 2));
+                        window.__FLOW2API_TRUSTED_SUBMIT_RESULT__ = null;
                         reportProgress(`trusted_submit:${trustedX}:${trustedY}`);
+                        submissionAccepted = await waitForSubmissionAcceptance(4000);
+                    }
+                    if (!submissionAccepted) {
+                        composer.focus();
+                        reportProgress("trusted_enter");
                         submissionAccepted = await waitForSubmissionAcceptance(4000);
                     }
                     if (!submissionAccepted) {
@@ -2232,8 +2321,16 @@ async function handleSubmitFlowRequest(data, socket) {
                             (composerRect.left + composerRect.width / 2) - (submitRect.left + submitRect.width / 2),
                             (composerRect.top + composerRect.height / 2) - (submitRect.top + submitRect.height / 2)
                         ));
+                        const trustedResult = window.__FLOW2API_TRUSTED_SUBMIT_RESULT__;
+                        const trustedResults = trustedResult?.requestId === String(requestId || "")
+                            ? trustedResult.results || {}
+                            : {};
+                        const trustedStatus = ["click", "enter"].map(operation => {
+                            const result = trustedResults[operation];
+                            return `${operation}=${result ? result.ok ? "ok" : `error:${result.error || "unknown"}` : "pending"}`;
+                        }).join(",");
                         throw new Error(
-                            `Flow did not acknowledge submit (editors=${visibleEditors.length},distance=${distance},form=${Number(Boolean(form))})`
+                            `Flow did not acknowledge submit (editors=${visibleEditors.length},distance=${distance},form=${Number(Boolean(form))},trusted=${trustedStatus})`
                         );
                     }
                     reportProgress("submission_accepted");
