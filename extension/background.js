@@ -1778,7 +1778,6 @@ async function handleSubmitFlowRequest(data, socket) {
                                 const hasResultCards = Array.from(document.querySelectorAll('img'))
                                     .some(image => /^(?:option|옵션)\s*\d+$/i.test(normalizedText(image.alt)));
                                 return Boolean(currentComposer)
-                                    && !normalizedText(currentComposer.textContent)
                                     && !hasResultCards;
                             },
                             10000,
