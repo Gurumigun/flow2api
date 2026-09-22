@@ -2050,8 +2050,16 @@ async function handleSubmitFlowRequest(data, socket) {
                         requestedAspect ? `in a ${requestedAspect} aspect ratio` : "",
                         requestedModel ? `using ${requestedModel}` : "",
                     ].filter(Boolean).join(" ") + ".";
+                    const promptBox = await waitFor(
+                        () => {
+                            const candidate = document.querySelector("flow-prompt-box");
+                            return candidate && isVisible(candidate) ? candidate : null;
+                        },
+                        8000,
+                        "Flow prompt box"
+                    );
                     const composer = await waitFor(
-                        () => Array.from(document.querySelectorAll('[contenteditable="true"]'))
+                        () => Array.from(promptBox.querySelectorAll('[contenteditable="true"]'))
                             .find(isVisible),
                         8000,
                         "Flow prompt composer"
@@ -2132,13 +2140,7 @@ async function handleSubmitFlowRequest(data, socket) {
                     const videoFailureBaseline = isVideo ? readVideoFailures() : null;
 
                     const findFlowSubmitButton = () => {
-                        const promptBox = (typeof composer.closest === "function"
-                            ? composer.closest("flow-prompt-box")
-                            : null)
-                            || (typeof document.querySelector === "function"
-                                ? document.querySelector("flow-prompt-box")
-                                : null);
-                        const scopes = promptBox ? [promptBox, document] : [document];
+                        const scopes = [promptBox, document];
                         for (const scope of scopes) {
                             const buttons = Array.from(scope.querySelectorAll("button"))
                                 .filter(button => isVisible(button)
@@ -2167,6 +2169,59 @@ async function handleSubmitFlowRequest(data, socket) {
                     );
                     clickElement(submitButton);
                     reportProgress("submitted");
+
+                    const submissionAcknowledged = () => {
+                        if (!composer.isConnected || !submitButton.isConnected) return true;
+                        if (imageGenerationIsActive()) return true;
+                        if (submitButton.disabled || submitButton.getAttribute("aria-disabled") === "true") return true;
+                        const composerText = normalizedText(composer.textContent);
+                        if (!composerText || !composerText.includes(normalizedText(prompt).slice(0, 48))) return true;
+                        return Array.from(currentMediaAssets().keys())
+                            .some(identity => !baselineIds.has(identity));
+                    };
+                    const waitForSubmissionAcknowledgement = async budgetMs => {
+                        const acknowledgementDeadline = Date.now() + budgetMs;
+                        while (Date.now() < acknowledgementDeadline) {
+                            if (submissionAcknowledged()) return true;
+                            await pause(200);
+                        }
+                        return false;
+                    };
+                    let submissionAccepted = await waitForSubmissionAcknowledgement(2500);
+                    if (!submissionAccepted) {
+                        const form = submitButton.closest("form") || promptBox.closest("form");
+                        if (form && typeof form.requestSubmit === "function") {
+                            try {
+                                form.requestSubmit(submitButton);
+                                reportProgress("submit_form_retry");
+                                submissionAccepted = await waitForSubmissionAcknowledgement(2500);
+                            } catch (_) {
+                                // A visible control can be associated with the form
+                                // without itself being a submit-type button.
+                            }
+                        }
+                    }
+                    if (!submissionAccepted) {
+                        composer.focus();
+                        for (const eventType of ["keydown", "keypress", "keyup"]) {
+                            composer.dispatchEvent(new KeyboardEvent(eventType, {
+                                key: "Enter",
+                                code: "Enter",
+                                bubbles: true,
+                                cancelable: true,
+                            }));
+                        }
+                        reportProgress("submit_enter_retry");
+                        submissionAccepted = await waitForSubmissionAcknowledgement(2500);
+                    }
+                    if (!submissionAccepted) {
+                        const icon = Array.from(submitButton.querySelectorAll("mat-icon, i"))
+                            .map(item => normalizedText(item.textContent)).find(Boolean) || "none";
+                        throw new Error(
+                            `Flow did not acknowledge the composer submission (icon=${icon.slice(0, 20)})`
+                        );
+                    }
+                    reportProgress("submission_accepted");
 
                     // Veo can legitimately remain in the Flow UI for well over six
                     // minutes. Honor the caller's bounded timeout for videos instead
@@ -2219,10 +2274,11 @@ async function handleSubmitFlowRequest(data, socket) {
                         const oldCards = resultCards.filter(image => submission.nodes.has(image)).length;
                         let resultHost = "none";
                         try {
+                            if (!resultCards[0]) throw new Error("missing result card");
                             const resultUrl = new URL(String(resultCards[0]?.currentSrc || resultCards[0]?.src || ""), location.href);
                             resultHost = String(resultUrl.hostname || resultUrl.protocol.replace(":", "") || "unknown").slice(0, 24);
                         } catch (_) {
-                            resultHost = "invalid";
+                            resultHost = resultCards[0] ? "invalid" : "none";
                         }
                         reportProgress(generationActive ? "generation_active"
                             : `result_wait:o${Number(submission.observed)}:c${resultCards.length}:l${loadedCards}:b${oldCards}:f${fresh.length}:u${resultHost}`);

@@ -178,9 +178,11 @@ class ExtensionReconnectContractTests(unittest.TestCase):
     def test_image_submit_prefers_the_current_prompt_box_control(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
 
-        self.assertIn('composer.closest("flow-prompt-box")', background)
+        self.assertIn('document.querySelector("flow-prompt-box")', background)
+        self.assertIn("promptBox.querySelectorAll('[contenteditable=\"true\"]')", background)
         self.assertIn('["arrow_upward", "arrow_forward", "send"]', background)
         self.assertIn("const submitButton = await waitFor(\n                        findFlowSubmitButton,", background)
+        self.assertIn("submissionAccepted = await waitForSubmissionAcknowledgement", background)
 
     def test_image_result_validation_runs_after_the_page_script_returns(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()

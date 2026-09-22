@@ -8,7 +8,10 @@ const directive = source.indexOf('const directive = [');
 const body = source.slice(Math.min(firstUpload, directive), source.indexOf('clickElement(submitButton);', directive));
 
 test('the actual composer preparation retains the uploaded reference until submit', async () => {
-  const promptBox = { querySelectorAll: selector => selector === 'button' ? [submit] : [] };
+  const promptBox = {
+    querySelectorAll: selector => selector === 'button' ? [submit]
+      : selector === '[contenteditable="true"]' ? [composer] : [],
+  };
   const composer = { nodes: ['old draft'], focus() {}, closest: () => promptBox };
   const submit = {
     disabled: false,
@@ -19,6 +22,7 @@ test('the actual composer preparation retains the uploaded reference until submi
   const input = { fileName: 'approved-reference.jpg' };
   const context = {
     document: {
+      querySelector: selector => selector === 'flow-prompt-box' ? promptBox : null,
       querySelectorAll: selector => selector === '[contenteditable="true"]' ? [composer] : [],
       createRange: () => ({ selectNodeContents() {} }),
       execCommand(command, _ui, value) {
