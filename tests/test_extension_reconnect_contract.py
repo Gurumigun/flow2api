@@ -175,14 +175,13 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn('generationActive ? "generation_active"', background)
         self.assertIn('`result_wait:o${Number(submission.observed)}', background)
 
-    def test_image_submit_prefers_the_current_prompt_box_control(self):
+    def test_image_submit_uses_the_proven_global_flow_controls(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
 
-        self.assertIn('document.querySelector("flow-prompt-box")', background)
-        self.assertIn("promptBox.querySelectorAll('[contenteditable=\"true\"]')", background)
-        self.assertIn('["arrow_upward", "arrow_forward", "send"]', background)
-        self.assertIn("const submitButton = await waitFor(\n                        findFlowSubmitButton,", background)
-        self.assertIn("submissionAccepted = await waitForSubmissionAcknowledgement", background)
+        self.assertIn("document.querySelectorAll('[contenteditable=\"true\"]')", background)
+        self.assertIn('const candidate = findButtonByIcon("arrow_forward")', background)
+        self.assertNotIn('"Flow prompt box"', background)
+        self.assertNotIn("waitForSubmissionAcknowledgement", background)
 
     def test_image_result_validation_runs_after_the_page_script_returns(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()

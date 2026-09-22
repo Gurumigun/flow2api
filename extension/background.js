@@ -2007,16 +2007,8 @@ async function handleSubmitFlowRequest(data, socket) {
                         requestedAspect ? `in a ${requestedAspect} aspect ratio` : "",
                         requestedModel ? `using ${requestedModel}` : "",
                     ].filter(Boolean).join(" ") + ".";
-                    const promptBox = await waitFor(
-                        () => {
-                            const candidate = document.querySelector("flow-prompt-box");
-                            return candidate && isVisible(candidate) ? candidate : null;
-                        },
-                        8000,
-                        "Flow prompt box"
-                    );
                     const composer = await waitFor(
-                        () => Array.from(promptBox.querySelectorAll('[contenteditable="true"]'))
+                        () => Array.from(document.querySelectorAll('[contenteditable="true"]'))
                             .find(isVisible),
                         8000,
                         "Flow prompt composer"
@@ -2096,89 +2088,19 @@ async function handleSubmitFlowRequest(data, socket) {
                     const baselineFailureCount = isVideo ? 0 : countFailureSignals();
                     const videoFailureBaseline = isVideo ? readVideoFailures() : null;
 
-                    const findFlowSubmitButton = () => {
-                        const scopes = [promptBox, document];
-                        for (const scope of scopes) {
-                            const buttons = Array.from(scope.querySelectorAll("button"))
-                                .filter(button => isVisible(button)
-                                    && !button.disabled
-                                    && button.getAttribute("aria-disabled") !== "true");
-                            for (const iconName of ["arrow_upward", "arrow_forward", "send"]) {
-                                const match = buttons.find(button => Array.from(
-                                    button.querySelectorAll("mat-icon, i")
-                                ).some(icon => normalizedText(icon.textContent) === iconName));
-                                if (match) return match;
-                            }
-                            const labelled = buttons.find(button => /^(?:send|submit|generate|create|보내기|생성|만들기)$/i.test(
-                                normalizedText([
-                                    button.getAttribute("aria-label"),
-                                    button.getAttribute("title"),
-                                ].filter(Boolean).join(" "))
-                            ));
-                            if (labelled) return labelled;
-                        }
-                        return null;
-                    };
                     const submitButton = await waitFor(
-                        findFlowSubmitButton,
+                        () => {
+                            const candidate = findButtonByIcon("arrow_forward");
+                            return candidate && !candidate.disabled
+                                && candidate.getAttribute("aria-disabled") !== "true"
+                                ? candidate
+                                : null;
+                        },
                         30000,
                         "enabled Flow image submit button"
                     );
                     clickElement(submitButton);
                     reportProgress("submitted");
-
-                    const submissionAcknowledged = () => {
-                        if (!composer.isConnected || !submitButton.isConnected) return true;
-                        if (imageGenerationIsActive()) return true;
-                        if (submitButton.disabled || submitButton.getAttribute("aria-disabled") === "true") return true;
-                        const composerText = normalizedText(composer.textContent);
-                        if (!composerText || !composerText.includes(normalizedText(prompt).slice(0, 48))) return true;
-                        return Array.from(currentMediaAssets().keys())
-                            .some(identity => !baselineIds.has(identity));
-                    };
-                    const waitForSubmissionAcknowledgement = async budgetMs => {
-                        const acknowledgementDeadline = Date.now() + budgetMs;
-                        while (Date.now() < acknowledgementDeadline) {
-                            if (submissionAcknowledged()) return true;
-                            await pause(200);
-                        }
-                        return false;
-                    };
-                    let submissionAccepted = await waitForSubmissionAcknowledgement(2500);
-                    if (!submissionAccepted) {
-                        const form = submitButton.closest("form") || promptBox.closest("form");
-                        if (form && typeof form.requestSubmit === "function") {
-                            try {
-                                form.requestSubmit(submitButton);
-                                reportProgress("submit_form_retry");
-                                submissionAccepted = await waitForSubmissionAcknowledgement(2500);
-                            } catch (_) {
-                                // A visible control can be associated with the form
-                                // without itself being a submit-type button.
-                            }
-                        }
-                    }
-                    if (!submissionAccepted) {
-                        composer.focus();
-                        for (const eventType of ["keydown", "keypress", "keyup"]) {
-                            composer.dispatchEvent(new KeyboardEvent(eventType, {
-                                key: "Enter",
-                                code: "Enter",
-                                bubbles: true,
-                                cancelable: true,
-                            }));
-                        }
-                        reportProgress("submit_enter_retry");
-                        submissionAccepted = await waitForSubmissionAcknowledgement(2500);
-                    }
-                    if (!submissionAccepted) {
-                        const icon = Array.from(submitButton.querySelectorAll("mat-icon, i"))
-                            .map(item => normalizedText(item.textContent)).find(Boolean) || "none";
-                        throw new Error(
-                            `Flow did not acknowledge the composer submission (icon=${icon.slice(0, 20)})`
-                        );
-                    }
-                    reportProgress("submission_accepted");
 
                     // Veo can legitimately remain in the Flow UI for well over six
                     // minutes. Honor the caller's bounded timeout for videos instead
