@@ -5,10 +5,12 @@ const source=readFileSync(new URL('../extension/background.js',import.meta.url),
 const start=source.slice(source.indexOf('// Each API request gets a clean conversation.'),source.indexOf('// The current flow.google.com editor keeps image defaults in'));
 test('new session is required and its old results must disappear before a request is sent',async()=>{
  for(const scenario of ['success','missing-button','old-session']){
-  let clicked=false;
+ let clicked=false;
   const button={getAttribute:()=> '새로운 세션 시작'};
-  const document={querySelectorAll:(selector)=>selector.startsWith('button')||selector.includes('[role="button"]')?(scenario==='missing-button'?[]:[button]):selector==='img'?(!clicked||scenario==='old-session'?[{alt:'Option 1'}]:[]):[{textContent:clicked&&scenario!=='old-session'?'제목 없는 세션':'기존 대화'}]};
-  const context={isVideo:false,document,isVisible:()=>true,normalizedText:v=>String(v||'').trim(),clickElement:()=>{clicked=true;},waitFor:async(probe,_ms,label)=>{const result=probe();if(!result)throw Error(label);return result;},pause:async()=>{},reportProgress:()=>{}};
+  const composer={textContent:'기존 프롬프트'};
+  const promptBox={querySelectorAll:selector=>selector==='[contenteditable="true"]'?[composer]:[]};
+  const document={querySelector:selector=>selector==='flow-prompt-box'?promptBox:null,querySelectorAll:(selector)=>selector.startsWith('button')||selector.includes('[role="button"]')?(scenario==='missing-button'?[]:[button]):selector==='img'?(!clicked||scenario==='old-session'?[{alt:'Option 1'}]:[]):[]};
+  const context={isVideo:false,document,isVisible:()=>true,normalizedText:v=>String(v||'').trim(),clickElement:()=>{clicked=true;if(scenario!=='old-session')composer.textContent='';},waitFor:async(probe,_ms,label)=>{const result=probe();if(!result)throw Error(label);return result;},pause:async()=>{},reportProgress:()=>{}};
   const run=()=>new Function(...Object.keys(context),`return (async()=>{${start}})()`)(...Object.values(context));
   if(scenario==='success')await run();else await assert.rejects(run,/Flow/);
  }
@@ -16,14 +18,17 @@ test('new session is required and its old results must disappear before a reques
 test('session reset also accepts Flow title-based English controls', async()=>{
  let clicked = false;
  const button = {getAttribute: name => name === 'title' ? 'New conversation' : '', textContent: ''};
+ const composer = {textContent: 'Existing prompt'};
+ const promptBox = {querySelectorAll: selector => selector === '[contenteditable="true"]' ? [composer] : []};
  const document = {
+   querySelector: selector => selector === 'flow-prompt-box' ? promptBox : null,
    querySelectorAll: selector => selector.startsWith('button') || selector.includes('[role="button"]') ? [button]
    : selector === 'img' ? (clicked ? [] : [{alt:'Option 1'}])
-   : [{textContent: clicked ? 'New conversation' : 'Existing conversation'}],
+   : [],
  };
  const context = {
   isVideo:false, document, isVisible:()=>true, normalizedText:v=>String(v||'').trim(),
-  clickElement:()=>{clicked=true;},
+  clickElement:()=>{clicked=true;composer.textContent='';},
   waitFor:async probe=>{const result=probe();if(!result)throw Error('reset not detected');return result;},
   pause:async()=>{},
   reportProgress:()=>{},

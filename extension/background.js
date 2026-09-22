@@ -1770,9 +1770,17 @@ async function handleSubmitFlowRequest(data, socket) {
                             if (confirmReset) clickElement(confirmReset);
                         }
                         await waitFor(
-                            () => Array.from(document.querySelectorAll('h2, [role="heading"]'))
-                                .some(heading => /(?:제목 없는 세션|제목 없음|새 세션|새로운 세션|untitled|new session|new conversation)/i.test(normalizedText(heading.textContent)))
-                                && !Array.from(document.querySelectorAll('img')).some(image => /^(?:option|옵션)\s*\d+$/i.test(normalizedText(image.alt))),
+                            () => {
+                                const currentPromptBox = document.querySelector("flow-prompt-box");
+                                const currentComposer = currentPromptBox && Array.from(
+                                    currentPromptBox.querySelectorAll('[contenteditable="true"]')
+                                ).find(isVisible);
+                                const hasResultCards = Array.from(document.querySelectorAll('img'))
+                                    .some(image => /^(?:option|옵션)\s*\d+$/i.test(normalizedText(image.alt)));
+                                return Boolean(currentComposer)
+                                    && !normalizedText(currentComposer.textContent)
+                                    && !hasResultCards;
+                            },
                             10000,
                             "empty Flow image session"
                         );
