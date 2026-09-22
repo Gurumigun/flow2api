@@ -2119,21 +2119,63 @@ async function handleSubmitFlowRequest(data, socket) {
                     clickElement(submitButton);
                     reportProgress("submitted");
 
-                    const acknowledgementDeadline = Date.now() + 8000;
-                    let submissionAccepted = false;
-                    while (Date.now() < acknowledgementDeadline) {
+                    const submissionWasAccepted = () => {
                         const composerText = normalizedText(composer.textContent);
                         const hasFreshAsset = Array.from(currentMediaAssets().keys())
                             .some(identity => !baselineIds.has(identity));
-                        submissionAccepted = imageGenerationIsActive()
+                        return imageGenerationIsActive()
                             || hasFreshAsset
                             || !composer.isConnected
                             || !submitButton.isConnected
                             || submitButton.disabled
                             || submitButton.getAttribute("aria-disabled") === "true"
                             || !composerText.includes(normalizedText(prompt).slice(0, 32));
-                        if (submissionAccepted) break;
-                        await pause(200);
+                    };
+                    const waitForSubmissionAcceptance = async budgetMs => {
+                        const acknowledgementDeadline = Date.now() + budgetMs;
+                        while (Date.now() < acknowledgementDeadline) {
+                            if (submissionWasAccepted()) return true;
+                            await pause(200);
+                        }
+                        return false;
+                    };
+                    let submissionAccepted = await waitForSubmissionAcceptance(2500);
+                    const form = submitButton.closest("form") || composer.closest("form");
+                    if (!submissionAccepted && form && typeof form.requestSubmit === "function") {
+                        try {
+                            form.requestSubmit();
+                            reportProgress("submit_form_retry");
+                            submissionAccepted = await waitForSubmissionAcceptance(2000);
+                        } catch (_) {
+                            // Continue to pointer/keyboard fallbacks.
+                        }
+                    }
+                    if (!submissionAccepted) {
+                        const rect = submitButton.getBoundingClientRect();
+                        const eventInit = {
+                            bubbles: true,
+                            cancelable: true,
+                            clientX: rect.left + rect.width / 2,
+                            clientY: rect.top + rect.height / 2,
+                            button: 0,
+                            buttons: 1,
+                        };
+                        for (const [type, EventClass] of [
+                            ["pointerdown", PointerEvent], ["mousedown", MouseEvent],
+                            ["pointerup", PointerEvent], ["mouseup", MouseEvent], ["click", MouseEvent],
+                        ]) submitButton.dispatchEvent(new EventClass(type, eventInit));
+                        reportProgress("submit_pointer_retry");
+                        submissionAccepted = await waitForSubmissionAcceptance(2000);
+                    }
+                    if (!submissionAccepted) {
+                        composer.focus();
+                        for (const type of ["keydown", "keypress", "keyup"]) {
+                            composer.dispatchEvent(new KeyboardEvent(type, {
+                                key: "Enter", code: "Enter", bubbles: true, cancelable: true,
+                            }));
+                        }
+                        reportProgress("submit_enter_retry");
+                        submissionAccepted = await waitForSubmissionAcceptance(2000);
                     }
                     if (!submissionAccepted) {
                         const composerRect = composer.getBoundingClientRect();
@@ -2142,7 +2184,7 @@ async function handleSubmitFlowRequest(data, socket) {
                             (composerRect.top + composerRect.height / 2) - (submitRect.top + submitRect.height / 2)
                         ));
                         throw new Error(
-                            `Flow did not acknowledge submit (editors=${visibleEditors.length},distance=${distance})`
+                            `Flow did not acknowledge submit (editors=${visibleEditors.length},distance=${distance},form=${Number(Boolean(form))})`
                         );
                     }
                     reportProgress("submission_accepted");

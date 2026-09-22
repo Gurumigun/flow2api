@@ -408,7 +408,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.50",
+                extension_version="1.3.51",
             )
         )
         generation_lock = service._route_locks.setdefault("google-1", asyncio.Lock())
@@ -439,7 +439,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.50",
+                extension_version="1.3.51",
             )
         )
 
@@ -465,7 +465,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.50",
+                extension_version="1.3.51",
             )
         )
 
@@ -492,7 +492,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.50",
+                extension_version="1.3.51",
             )
         )
 
@@ -592,7 +592,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.50",
+                extension_version="1.3.51",
             )
         )
 
@@ -623,7 +623,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.50",
+                extension_version="1.3.51",
             )
         )
 
@@ -670,7 +670,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(websocket=websocket, route_key="google-1")
         )
 
-        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.50"):
+        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.51"):
             await service.submit_flow_request(
                 project_id="project-a",
                 action="IMAGE_GENERATION",
@@ -695,7 +695,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.50") as raised:
+        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.51") as raised:
             await service.submit_flow_request(
                 project_id="project-a",
                 action="IMAGE_GENERATION",
