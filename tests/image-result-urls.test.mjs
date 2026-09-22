@@ -9,6 +9,8 @@ const parser=(isVideo)=>new Function('isVideo','location',`${parseSource};return
 test('signed Google conversation images do not require legacy gallery URL paths',()=>{
  const signed='https://lh3.googleusercontent.com/gg-dl/current-result=s1024';
  assert(allowed(signed)); assert.equal(parser(false)(signed).url,signed);
+ assert(allowed('https://storage.googleapis.com/flow-results/generated.png'));
+ assert(allowed('https://ssl.gstatic.com/flow/generated.png'));
  assert.equal(parser(true)(signed),null,'new image paths are not video results');
  for(const url of ['https://unrelated.test/image.png','https://googleusercontent.com.evil.test/asb/image','http://lh3.googleusercontent.com/image','data:text/plain;base64,eA==','data:image/svg+xml;base64,eA==']) assert.equal(allowed(url),false);
 });

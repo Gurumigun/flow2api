@@ -658,6 +658,8 @@ function isCurrentFlowImageUrl(rawUrl) {
             || parsed.hostname === "flow-content.google"
             || parsed.hostname === "lh3.google.com"
             || /(^|\.)googleusercontent\.com$/.test(parsed.hostname)
+            || /(^|\.)googleapis\.com$/.test(parsed.hostname)
+            || /(^|\.)gstatic\.com$/.test(parsed.hostname)
         ));
     } catch (_) {
         return false;
@@ -944,6 +946,8 @@ async function readCurrentFlowImageCandidates(tabId, expectedRequestId) {
                         || parsed.hostname === "flow-content.google"
                         || parsed.hostname === "lh3.google.com"
                         || /(^|\.)googleusercontent\.com$/.test(parsed.hostname)
+                        || /(^|\.)googleapis\.com$/.test(parsed.hostname)
+                        || /(^|\.)gstatic\.com$/.test(parsed.hostname)
                     );
                     if (parsed.hostname === "flow-content.google") {
                         const match = parsed.pathname.match(
@@ -1490,6 +1494,8 @@ async function handleSubmitFlowRequest(data, socket) {
                                 || parsed.hostname === "flow-content.google"
                                 || parsed.hostname === "lh3.google.com"
                                 || /(^|\.)googleusercontent\.com$/.test(parsed.hostname)
+                                || /(^|\.)googleapis\.com$/.test(parsed.hostname)
+                                || /(^|\.)gstatic\.com$/.test(parsed.hostname)
                             );
                             if (parsed.hostname === "flow-content.google") {
                                 const match = parsed.pathname.match(
@@ -2188,8 +2194,15 @@ async function handleSubmitFlowRequest(data, socket) {
                             .filter(image => /^(?:option|옵션)\s*\d+$/i.test(normalizedText(image.alt)));
                         const loadedCards = resultCards.filter(image => image.complete && image.naturalWidth).length;
                         const oldCards = resultCards.filter(image => submission.nodes.has(image)).length;
+                        let resultHost = "none";
+                        try {
+                            const resultUrl = new URL(String(resultCards[0]?.currentSrc || resultCards[0]?.src || ""), location.href);
+                            resultHost = String(resultUrl.hostname || resultUrl.protocol.replace(":", "") || "unknown").slice(0, 24);
+                        } catch (_) {
+                            resultHost = "invalid";
+                        }
                         reportProgress(generationActive ? "generation_active"
-                            : `result_wait:o${Number(submission.observed)}:c${resultCards.length}:l${loadedCards}:b${oldCards}:f${fresh.length}`);
+                            : `result_wait:o${Number(submission.observed)}:c${resultCards.length}:l${loadedCards}:b${oldCards}:f${fresh.length}:u${resultHost}`);
                         if (fresh.length) {
                             const ids = fresh.map(asset => asset.identity).sort().join(",");
                             stablePolls = ids === stableIds ? stablePolls + 1 : 1;
