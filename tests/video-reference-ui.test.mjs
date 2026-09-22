@@ -8,8 +8,13 @@ const directive = source.indexOf('const directive = [');
 const body = source.slice(Math.min(firstUpload, directive), source.indexOf('clickElement(submitButton);', directive));
 
 test('the actual composer preparation retains the uploaded reference until submit', async () => {
-  const composer = { nodes: ['old draft'], focus() {} };
-  const submit = { disabled: false, getAttribute: () => 'false' };
+  const promptBox = { querySelectorAll: selector => selector === 'button' ? [submit] : [] };
+  const composer = { nodes: ['old draft'], focus() {}, closest: () => promptBox };
+  const submit = {
+    disabled: false,
+    getAttribute: () => 'false',
+    querySelectorAll: selector => selector === 'mat-icon, i' ? [{ textContent: 'arrow_upward' }] : [],
+  };
   const selection = { removeAllRanges() {}, addRange() {} };
   const input = { fileName: 'approved-reference.jpg' };
   const context = {

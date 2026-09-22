@@ -2131,14 +2131,37 @@ async function handleSubmitFlowRequest(data, socket) {
                     const baselineFailureCount = isVideo ? 0 : countFailureSignals();
                     const videoFailureBaseline = isVideo ? readVideoFailures() : null;
 
+                    const findFlowSubmitButton = () => {
+                        const promptBox = (typeof composer.closest === "function"
+                            ? composer.closest("flow-prompt-box")
+                            : null)
+                            || (typeof document.querySelector === "function"
+                                ? document.querySelector("flow-prompt-box")
+                                : null);
+                        const scopes = promptBox ? [promptBox, document] : [document];
+                        for (const scope of scopes) {
+                            const buttons = Array.from(scope.querySelectorAll("button"))
+                                .filter(button => isVisible(button)
+                                    && !button.disabled
+                                    && button.getAttribute("aria-disabled") !== "true");
+                            for (const iconName of ["arrow_upward", "arrow_forward", "send"]) {
+                                const match = buttons.find(button => Array.from(
+                                    button.querySelectorAll("mat-icon, i")
+                                ).some(icon => normalizedText(icon.textContent) === iconName));
+                                if (match) return match;
+                            }
+                            const labelled = buttons.find(button => /^(?:send|submit|generate|create|보내기|생성|만들기)$/i.test(
+                                normalizedText([
+                                    button.getAttribute("aria-label"),
+                                    button.getAttribute("title"),
+                                ].filter(Boolean).join(" "))
+                            ));
+                            if (labelled) return labelled;
+                        }
+                        return null;
+                    };
                     const submitButton = await waitFor(
-                        () => {
-                            const candidate = findButtonByIcon("arrow_forward");
-                            return candidate && !candidate.disabled
-                                && candidate.getAttribute("aria-disabled") !== "true"
-                                ? candidate
-                                : null;
-                        },
+                        findFlowSubmitButton,
                         30000,
                         "enabled Flow image submit button"
                     );
