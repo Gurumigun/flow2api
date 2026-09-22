@@ -638,7 +638,13 @@ async function connectWS() {
 
 function isCurrentFlowImageUrl(rawUrl) {
     try {
-        const parsed = new URL(String(rawUrl || ""));
+        const sourceUrl = String(rawUrl || "").trim();
+        const isInlineImage = (
+            sourceUrl.length <= 28_000_000
+            && /^data:image\/(?:png|jpeg|webp);base64,[a-z0-9+/=\s]+$/i.test(sourceUrl)
+        );
+        if (isInlineImage) return true;
+        const parsed = new URL(sourceUrl);
         const isFlowPageBlob = (
             parsed.protocol === "blob:"
             && parsed.origin === "https://flow.google.com"
@@ -957,13 +963,22 @@ async function readCurrentFlowImageCandidates(tabId, expectedRequestId) {
                         parsed.hostname === "lh3.google.com" && parsed.pathname.startsWith("/rd-asb/")
                     );
                     const isLocalFlowBlob = parsed.protocol === "blob:" && parsed.origin === location.origin;
-                    if (!mediaId && !isCurrentFlowAsset && !isLocalFlowBlob
+                    const isInlineImage = (
+                        parsed.protocol === "data:"
+                        && parsed.pathname.length <= 28_000_000
+                        && /^image\/(?:png|jpeg|webp);base64,[a-z0-9+/=\s]+$/i.test(parsed.pathname)
+                    );
+                    if (!mediaId && !isCurrentFlowAsset && !isLocalFlowBlob && !isInlineImage
                         && !(parsed.protocol === "https:" && isGoogleImageHost)) return;
                     const canonicalUrl = parsed.toString().replace(
                         /=s\d+(?:-[a-z0-9-]+)?(?=$|[?#])/i,
                         "",
                     );
-                    const identity = mediaId ? `media:${mediaId}` : `url:${canonicalUrl}`;
+                    const identity = mediaId
+                        ? `media:${mediaId}`
+                        : parsed.protocol === "data:"
+                            ? `data:${canonicalUrl.length}:${canonicalUrl.slice(-64)}`
+                            : `url:${canonicalUrl}`;
                     assets.set(identity, { identity, mediaId, url: parsed.toString() });
                 } catch (_) {
                     // Ignore unrelated or malformed page images.
@@ -1499,7 +1514,13 @@ async function handleSubmitFlowRequest(data, socket) {
                                 && parsed.pathname.startsWith("/rd-asb/")
                             );
                             const isLocalFlowBlob = parsed.protocol === "blob:" && parsed.origin === location.origin;
-                            if (!mediaId && !isCurrentFlowAsset && !isLocalFlowBlob
+                            const isInlineImage = (
+                                !isVideo
+                                && parsed.protocol === "data:"
+                                && parsed.pathname.length <= 28_000_000
+                                && /^image\/(?:png|jpeg|webp);base64,[a-z0-9+/=\s]+$/i.test(parsed.pathname)
+                            );
+                            if (!mediaId && !isCurrentFlowAsset && !isLocalFlowBlob && !isInlineImage
                                 && !(!isVideo && parsed.protocol === "https:" && isGoogleImageHost)) return null;
 
                             const canonicalUrl = parsed.toString().replace(
@@ -1507,7 +1528,11 @@ async function handleSubmitFlowRequest(data, socket) {
                                 "",
                             );
                             return {
-                                identity: mediaId ? `media:${mediaId}` : `url:${canonicalUrl}`,
+                                identity: mediaId
+                                    ? `media:${mediaId}`
+                                    : parsed.protocol === "data:"
+                                        ? `data:${canonicalUrl.length}:${canonicalUrl.slice(-64)}`
+                                        : `url:${canonicalUrl}`,
                                 mediaId,
                                 url: parsed.toString(),
                             };
@@ -2153,6 +2178,11 @@ async function handleSubmitFlowRequest(data, socket) {
                         const assets = currentMediaAssets();
                         const fresh = Array.from(assets.values())
                             .filter(asset => !baselineIds.has(asset.identity));
+                        // Some Flow variants render a completed option without ever
+                        // exposing a visible generating/stop control. A fresh option
+                        // in the verified clean session is itself proof that this
+                        // submission produced a result.
+                        if (!isVideo && fresh.length) submission.observed = true;
                         // Counts only: never expose prompts, image URLs or tokens.
                         const resultCards = Array.from(document.querySelectorAll("img"))
                             .filter(image => /^(?:option|옵션)\s*\d+$/i.test(normalizedText(image.alt)));

@@ -25,12 +25,12 @@ test('baseline captures pending images; previously mounted gallery nodes cannot 
 });
 
 const loop = source.slice(source.indexOf('const uiTimeoutMs ='), source.indexOf('\n                };\n\n                const parsedRequestUrl'));
-async function runLoop(active) {
+async function runLoop(active, hasFreshAsset = () => true) {
   let time = 0, polls = 0;
   const submission = { observed: false, nodes: new WeakSet() };
   const context = { isVideo:false, timeoutMs:180000, Date:{now:()=>time}, submission, document:{querySelectorAll:()=>[]},
     pause:async()=>{time+=1000;polls++;},
-    currentMediaAssets:()=>new Map([['fresh',asset('fresh')]]),
+    currentMediaAssets:()=>hasFreshAsset(polls) ? new Map([['fresh',asset('fresh')]]) : new Map(),
     imageGenerationIsActive:()=>active(polls), reportProgress(){}, findGenerationApproval:()=>null,
     baselineIds:new Set(), baselineFailureCount:0, countFailureSignals:()=>0, nextImageFailurePollCount:()=>0,
     prompt:'new image', imageRequest:{}, browserFingerprint:()=>({}) };
@@ -38,11 +38,17 @@ async function runLoop(active) {
   return { result, polls };
 }
 test('page yields to worker after observed generation; never returns gallery as result', async () => {
-  const { result, polls } = await runLoop((n)=>n>=4 && n<=10);
+  const { result, polls } = await runLoop((n)=>n>=4 && n<=10, n=>n>=4);
   assert.equal(polls,4);
   assert.equal(result.flow2apiImagePolling,true);
-  await assert.rejects(()=>runLoop(()=>false),/Timed out/);
+  await assert.rejects(()=>runLoop(()=>false,()=>false),/Timed out/);
   assert.equal((await runLoop(()=>true)).result.flow2apiImagePolling,true);
+});
+
+test('a fresh completed option proves submission even when Flow never exposes a stop control', async () => {
+  const { result, polls } = await runLoop(() => false, n => n >= 3);
+  assert.equal(result.flow2apiImagePolling, true);
+  assert(polls >= 4);
 });
 
 const validation = source.slice(source.indexOf('async function validateCurrentFlowImages('),source.indexOf('async function readCurrentFlowImageCandidates('));
