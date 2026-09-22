@@ -1182,6 +1182,13 @@ function sendFlowSubmitProgress(data, socket, phase) {
 
 function dispatchTrustedFlowClick(tabId, x, y) {
     const target = { tabId: Number(tabId) };
+    const attach = () => new Promise((resolve, reject) => {
+        chrome.debugger.attach(target, "1.3", () => {
+            const error = chrome.runtime.lastError;
+            if (error) reject(new Error(error.message));
+            else resolve();
+        });
+    });
     const sendCommand = (method, params) => new Promise((resolve, reject) => {
         chrome.debugger.sendCommand(target, method, params, () => {
             const error = chrome.runtime.lastError;
@@ -1189,36 +1196,40 @@ function dispatchTrustedFlowClick(tabId, x, y) {
             else resolve();
         });
     });
-    return new Promise((resolve, reject) => {
-        chrome.debugger.attach(target, "1.3", async () => {
-            const attachError = chrome.runtime.lastError;
-            if (attachError) {
-                reject(new Error(attachError.message));
-                return;
-            }
-            try {
-                await sendCommand("Page.bringToFront", {});
-                await sendCommand("Input.dispatchMouseEvent", {
-                    type: "mouseMoved", x, y, button: "none", buttons: 0,
-                });
-                await sendCommand("Input.dispatchMouseEvent", {
-                    type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1,
-                });
-                await sendCommand("Input.dispatchMouseEvent", {
-                    type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1,
-                });
-                resolve();
-            } catch (error) {
-                reject(error);
-            } finally {
-                chrome.debugger.detach(target, () => void chrome.runtime.lastError);
-            }
+    const detach = () => new Promise(resolve => {
+        chrome.debugger.detach(target, () => {
+            void chrome.runtime.lastError;
+            resolve();
         });
     });
+    return (async () => {
+        await attach();
+        try {
+            await sendCommand("Page.bringToFront", {});
+            await sendCommand("Input.dispatchMouseEvent", {
+                type: "mouseMoved", x, y, button: "none", buttons: 0,
+            });
+            await sendCommand("Input.dispatchMouseEvent", {
+                type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1,
+            });
+            await sendCommand("Input.dispatchMouseEvent", {
+                type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1,
+            });
+        } finally {
+            await detach();
+        }
+    })();
 }
 
 function dispatchTrustedFlowEnter(tabId) {
     const target = { tabId: Number(tabId) };
+    const attach = () => new Promise((resolve, reject) => {
+        chrome.debugger.attach(target, "1.3", () => {
+            const error = chrome.runtime.lastError;
+            if (error) reject(new Error(error.message));
+            else resolve();
+        });
+    });
     const sendCommand = (method, params) => new Promise((resolve, reject) => {
         chrome.debugger.sendCommand(target, method, params, () => {
             const error = chrome.runtime.lastError;
@@ -1226,36 +1237,33 @@ function dispatchTrustedFlowEnter(tabId) {
             else resolve();
         });
     });
-    return new Promise((resolve, reject) => {
-        chrome.debugger.attach(target, "1.3", async () => {
-            const attachError = chrome.runtime.lastError;
-            if (attachError) {
-                reject(new Error(attachError.message));
-                return;
-            }
-            try {
-                await sendCommand("Page.bringToFront", {});
-                await sendCommand("Input.dispatchKeyEvent", {
-                    type: "rawKeyDown", key: "Enter", code: "Enter",
-                    windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
-                });
-                await sendCommand("Input.dispatchKeyEvent", {
-                    type: "char", key: "Enter", code: "Enter", text: "\r",
-                    unmodifiedText: "\r", windowsVirtualKeyCode: 13,
-                    nativeVirtualKeyCode: 13,
-                });
-                await sendCommand("Input.dispatchKeyEvent", {
-                    type: "keyUp", key: "Enter", code: "Enter",
-                    windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
-                });
-                resolve();
-            } catch (error) {
-                reject(error);
-            } finally {
-                chrome.debugger.detach(target, () => void chrome.runtime.lastError);
-            }
+    const detach = () => new Promise(resolve => {
+        chrome.debugger.detach(target, () => {
+            void chrome.runtime.lastError;
+            resolve();
         });
     });
+    return (async () => {
+        await attach();
+        try {
+            await sendCommand("Page.bringToFront", {});
+            await sendCommand("Input.dispatchKeyEvent", {
+                type: "rawKeyDown", key: "Enter", code: "Enter",
+                windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+            });
+            await sendCommand("Input.dispatchKeyEvent", {
+                type: "char", key: "Enter", code: "Enter", text: "\r",
+                unmodifiedText: "\r", windowsVirtualKeyCode: 13,
+                nativeVirtualKeyCode: 13,
+            });
+            await sendCommand("Input.dispatchKeyEvent", {
+                type: "keyUp", key: "Enter", code: "Enter",
+                windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+            });
+        } finally {
+            await detach();
+        }
+    })();
 }
 
 function recordTrustedSubmitResult(tabId, requestId, operation, ok, error = "") {
@@ -2311,7 +2319,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         submissionAccepted = await waitForSubmissionAcceptance(4000);
                     }
                     if (!submissionAccepted) {
-                        composer.focus();
+                        submitButton.focus();
                         reportProgress("trusted_enter");
                         submissionAccepted = await waitForSubmissionAcceptance(4000);
                     }
