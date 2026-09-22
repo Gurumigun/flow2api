@@ -2007,9 +2007,26 @@ async function handleSubmitFlowRequest(data, socket) {
                         requestedAspect ? `in a ${requestedAspect} aspect ratio` : "",
                         requestedModel ? `using ${requestedModel}` : "",
                     ].filter(Boolean).join(" ") + ".";
+                    const initialSubmitButton = await waitFor(
+                        () => findButtonByIcon("arrow_forward"),
+                        8000,
+                        "Flow image submit control"
+                    );
+                    const submitRect = initialSubmitButton.getBoundingClientRect();
+                    let visibleEditors = [];
                     const composer = await waitFor(
-                        () => Array.from(document.querySelectorAll('[contenteditable="true"]'))
-                            .find(isVisible),
+                        () => {
+                            visibleEditors = Array.from(document.querySelectorAll('[contenteditable="true"]'))
+                                .filter(isVisible);
+                            return visibleEditors
+                            .map(editor => {
+                                const rect = editor.getBoundingClientRect();
+                                const dx = (rect.left + rect.width / 2) - (submitRect.left + submitRect.width / 2);
+                                const dy = (rect.top + rect.height / 2) - (submitRect.top + submitRect.height / 2);
+                                return { editor, distance: Math.hypot(dx, dy) };
+                            })
+                            .sort((left, right) => left.distance - right.distance)[0]?.editor || null;
+                        },
                         8000,
                         "Flow prompt composer"
                     );
@@ -2101,6 +2118,34 @@ async function handleSubmitFlowRequest(data, socket) {
                     );
                     clickElement(submitButton);
                     reportProgress("submitted");
+
+                    const acknowledgementDeadline = Date.now() + 8000;
+                    let submissionAccepted = false;
+                    while (Date.now() < acknowledgementDeadline) {
+                        const composerText = normalizedText(composer.textContent);
+                        const hasFreshAsset = Array.from(currentMediaAssets().keys())
+                            .some(identity => !baselineIds.has(identity));
+                        submissionAccepted = imageGenerationIsActive()
+                            || hasFreshAsset
+                            || !composer.isConnected
+                            || !submitButton.isConnected
+                            || submitButton.disabled
+                            || submitButton.getAttribute("aria-disabled") === "true"
+                            || !composerText.includes(normalizedText(prompt).slice(0, 32));
+                        if (submissionAccepted) break;
+                        await pause(200);
+                    }
+                    if (!submissionAccepted) {
+                        const composerRect = composer.getBoundingClientRect();
+                        const distance = Math.round(Math.hypot(
+                            (composerRect.left + composerRect.width / 2) - (submitRect.left + submitRect.width / 2),
+                            (composerRect.top + composerRect.height / 2) - (submitRect.top + submitRect.height / 2)
+                        ));
+                        throw new Error(
+                            `Flow did not acknowledge submit (editors=${visibleEditors.length},distance=${distance})`
+                        );
+                    }
+                    reportProgress("submission_accepted");
 
                     // Veo can legitimately remain in the Flow UI for well over six
                     // minutes. Honor the caller's bounded timeout for videos instead

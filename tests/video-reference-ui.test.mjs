@@ -12,10 +12,11 @@ test('the actual composer preparation retains the uploaded reference until submi
     querySelectorAll: selector => selector === 'button' ? [submit]
       : selector === '[contenteditable="true"]' ? [composer] : [],
   };
-  const composer = { nodes: ['old draft'], focus() {}, closest: () => promptBox };
+  const composer = { nodes: ['old draft'], focus() {}, closest: () => promptBox, getBoundingClientRect: () => ({left: 0, top: 0, width: 300, height: 80}) };
   const submit = {
     disabled: false,
     getAttribute: () => 'false',
+    getBoundingClientRect: () => ({left: 300, top: 0, width: 40, height: 40}),
     querySelectorAll: selector => selector === 'mat-icon, i' ? [{ textContent: 'arrow_upward' }] : [],
   };
   const selection = { removeAllRanges() {}, addRange() {} };

@@ -11,7 +11,7 @@ class ImageResultVersionTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 'extension_reload_required')
 
     def test_validating_workers_are_accepted(self):
-        for version in ('1.3.49', '1.4.0', '2.0.0'):
+        for version in ('1.3.50', '1.4.0', '2.0.0'):
             ExtensionCaptchaService._require_image_ui_version(version)
 
     def test_video_worker_requires_extended_wait_support(self):
