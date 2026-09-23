@@ -572,13 +572,13 @@ class Config:
 
     @property
     def extension_image_total_timeout_seconds(self) -> float:
-        """扩展图片生成与账号切换的总时间预算，需低于常见 300 秒网关限制。"""
+        """Total image budget. Default fits 300s gateways; local clients may explicitly allow longer."""
         value = self._config.get("captcha", {}).get(
             "extension_image_total_timeout_seconds",
             270.0,
         )
         try:
-            return max(60.0, min(285.0, float(value)))
+            return max(60.0, min(540.0, float(value)))
         except Exception:
             return 270.0
 

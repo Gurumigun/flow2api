@@ -12,6 +12,8 @@ from curl_cffi.requests import AsyncSession
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .streaming import with_sse_heartbeat
+
 from ..core.auth import AuthManager, verify_api_key_flexible
 from ..core.image_rights import image_rights_scope, validate_image_rights_consents
 from ..core.logger import debug_logger
@@ -886,7 +888,7 @@ async def create_chat_completion(
 
         if request.stream:
             return StreamingResponse(
-                _iterate_openai_stream(normalized, request_base_url),
+                with_sse_heartbeat(_iterate_openai_stream(normalized, request_base_url)),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",

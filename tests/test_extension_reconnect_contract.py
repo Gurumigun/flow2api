@@ -112,9 +112,10 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("Nano Banana 2 Lite", background)
         self.assertIn("flow-add-menu-popover-content", background)
         self.assertIn("inputUploads", background)
-        self.assertIn("Flow native upload", background)
+        self.assertIn("Flow reference upload confirmation", background)
+        self.assertIn("uploaded Flow reference", background)
         self.assertIn("HTMLInputElement.prototype.click", background)
-        self.assertIn('parsed.pathname.startsWith("/asb/")', background)
+        self.assertIn('parsed.protocol === "https:"', background)
         self.assertIn('parsed.hostname === "flow-content.google"', background)
         self.assertIn('parsed.searchParams.get("name")', background)
         self.assertIn("embedCurrentFlowImages", background)
@@ -171,7 +172,31 @@ class ExtensionReconnectContractTests(unittest.TestCase):
 
         self.assertIn('button.getAttribute("aria-disabled") === "true"', background)
         self.assertIn('(disabled && /initiating image generation|이미지 생성 시작/.test(label))', background)
-        self.assertIn('generationActive ? "generation_active" : "waiting_for_result"', background)
+        self.assertIn('generationActive ? "generation_active"', background)
+        self.assertIn('`result_wait:o${Number(submission.observed)}', background)
+
+    def test_image_submit_selects_the_editor_nearest_the_flow_control(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn("document.querySelectorAll('[contenteditable=\"true\"]')", background)
+        self.assertIn('const candidate = findButtonByIcon("arrow_forward")', background)
+        self.assertNotIn('"Flow prompt box"', background)
+        self.assertIn("Math.hypot(dx, dy)", background)
+        self.assertIn("Flow did not acknowledge submit", background)
+
+    def test_image_submit_can_dispatch_a_trusted_chrome_click(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+        manifest = (REPO_ROOT / "extension" / "manifest.json").read_text()
+
+        self.assertIn('"debugger"', manifest)
+        self.assertIn('chrome.debugger.attach(target, "1.3"', background)
+        self.assertIn('"Page.bringToFront"', background)
+        self.assertIn('"Input.dispatchKeyEvent"', background)
+        self.assertIn('phase === "trusted_enter"', background)
+        self.assertIn('submitButton.focus()', background)
+        self.assertIn('await detach()', background)
+        self.assertIn('"Input.dispatchMouseEvent"', background)
+        self.assertIn('reportProgress(`trusted_submit:${trustedX}:${trustedY}`)', background)
 
     def test_image_result_validation_runs_after_the_page_script_returns(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()

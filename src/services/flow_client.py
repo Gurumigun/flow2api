@@ -1111,7 +1111,7 @@ class FlowClient:
             response = await service.submit_flow_request(
                 project_id=project_id, action=action, token_id=token_id,
                 url=url, at_token=at, json_data=json_data,
-                timeout=max(timeout, 300) if native_ui else timeout,
+                timeout=max(timeout, 900) if native_ui else timeout,
             )
             fingerprint = response.get("fingerprint")
             self._set_request_fingerprint(fingerprint if isinstance(fingerprint, dict) else None)

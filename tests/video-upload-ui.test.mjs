@@ -11,7 +11,10 @@ function uploaderFixture({ approved, earlyDialog = false }) {
   const filename = 'approved-product.jpg';
   const image = { src: 'https://flow.google.com/asb/product', closest: () => null };
   const oldOption = { textContent: 'unrelated old photo', querySelector: () => ({ src: 'old' }) };
-  const option = { textContent: filename, querySelector: () => image };
+  const option = {
+    textContent: filename,
+    querySelector: selector => selector === '.asset-title' ? { textContent: filename } : image,
+  };
   class Input {
     constructor() { this.type = 'file'; }
     click() { throw new Error('Native file chooser must be intercepted'); }
@@ -29,7 +32,7 @@ function uploaderFixture({ approved, earlyDialog = false }) {
   const dialog = { textContent: '이 이미지를 사용할 권리', querySelectorAll: () => [agree] };
   const uploadButton = {};
   const search = {};
-  const addButton = {};
+  const addButton = { textContent: '프롬프트에 추가' };
   const picker = {
     querySelector(selector) {
       if (selector === '.sidebar-upload-btn') return uploadButton;
@@ -39,12 +42,14 @@ function uploaderFixture({ approved, earlyDialog = false }) {
     },
     querySelectorAll(selector) {
       if (selector === 'button.asset-item[role="option"]') return uploaded ? [oldOption, option] : [oldOption];
-      if (selector === 'img') return [];
+      if (selector === 'img') return selected ? [{ alt: `${filename} preview` }] : [];
+      if (selector === 'button') return [addButton];
       return [];
     },
   };
   const context = {
     normalizedText: value => String(value || '').replace(/\s+/g, ' ').trim(),
+    readyPromptReferences: () => added ? [image] : [],
     openAssetPicker: async () => picker,
     isVisible: element => element === dialog ? dialogVisible : Boolean(element),
     clickElement(element) {

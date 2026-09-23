@@ -8,12 +8,22 @@ const directive = source.indexOf('const directive = [');
 const body = source.slice(Math.min(firstUpload, directive), source.indexOf('clickElement(submitButton);', directive));
 
 test('the actual composer preparation retains the uploaded reference until submit', async () => {
-  const composer = { nodes: ['old draft'], focus() {} };
-  const submit = { disabled: false, getAttribute: () => 'false' };
+  const promptBox = {
+    querySelectorAll: selector => selector === 'button' ? [submit]
+      : selector === '[contenteditable="true"]' ? [composer] : [],
+  };
+  const composer = { nodes: ['old draft'], focus() {}, closest: () => promptBox, getBoundingClientRect: () => ({left: 0, top: 0, width: 300, height: 80}) };
+  const submit = {
+    disabled: false,
+    getAttribute: () => 'false',
+    getBoundingClientRect: () => ({left: 300, top: 0, width: 40, height: 40}),
+    querySelectorAll: selector => selector === 'mat-icon, i' ? [{ textContent: 'arrow_upward' }] : [],
+  };
   const selection = { removeAllRanges() {}, addRange() {} };
   const input = { fileName: 'approved-reference.jpg' };
   const context = {
     document: {
+      querySelector: selector => selector === 'flow-prompt-box' ? promptBox : null,
       querySelectorAll: selector => selector === '[contenteditable="true"]' ? [composer] : [],
       createRange: () => ({ selectNodeContents() {} }),
       execCommand(command, _ui, value) {
@@ -25,7 +35,10 @@ test('the actual composer preparation retains the uploaded reference until submi
     getSelection: () => selection,
     inputUploads: [input], inputFileNames: [],
     attachNativeUpload: async upload => { composer.nodes.push({ reference: upload.fileName }); },
+    readyPromptReferences: () => [{}],
     isVideo: true, requestedInputs: [input], prompt: 'Show adult hands using this product.',
+    requestId: 'video-request-1',
+    window: {},
     requestedAspect: '9:16', requestedModel: 'Veo 3.1 Fast',
     isVisible: () => true, normalizedText: value => value, reportProgress() {},
     waitFor: async probe => { const result = probe(); assert.ok(result); return result; },

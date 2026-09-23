@@ -408,7 +408,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.30",
+                extension_version="1.3.55",
             )
         )
         generation_lock = service._route_locks.setdefault("google-1", asyncio.Lock())
@@ -439,7 +439,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.30",
+                extension_version="1.3.55",
             )
         )
 
@@ -465,7 +465,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.30",
+                extension_version="1.3.55",
             )
         )
 
@@ -492,7 +492,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.30",
+                extension_version="1.3.55",
             )
         )
 
@@ -592,7 +592,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.30",
+                extension_version="1.3.55",
             )
         )
 
@@ -623,7 +623,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.30",
+                extension_version="1.3.55",
             )
         )
 
@@ -670,7 +670,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(websocket=websocket, route_key="google-1")
         )
 
-        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.30"):
+        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.55"):
             await service.submit_flow_request(
                 project_id="project-a",
                 action="IMAGE_GENERATION",
@@ -684,7 +684,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
                 timeout=15,
             )
 
-    async def test_current_flow_image_submit_requires_version_1_3_30(self):
+    async def test_current_flow_image_submit_requires_version_1_3_44(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())
         websocket = _ImmediateExtensionSocket(service)
         service.active_connections.append(
@@ -695,7 +695,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.30") as raised:
+        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.55") as raised:
             await service.submit_flow_request(
                 project_id="project-a",
                 action="IMAGE_GENERATION",
@@ -815,6 +815,25 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await balancer.get_extension_transport_cooldown_remaining(first.id),
             0,
+        )
+
+    async def test_stalled_extension_route_cooldown_backoffs_until_success(self):
+        token = Token(id=7, st="st-7", at="at-7", email="stalled@example.com")
+        balancer = LoadBalancer(_TokenManagerStub([token]))
+
+        first = await balancer.record_extension_transport_failure(token.id)
+        second = await balancer.record_extension_transport_failure(token.id)
+        third = await balancer.record_extension_transport_failure(token.id)
+
+        self.assertEqual((first, second, third), (120.0, 240.0, 480.0))
+        await balancer.record_extension_transport_success(token.id)
+        self.assertEqual(
+            await balancer.get_extension_transport_cooldown_remaining(token.id),
+            0,
+        )
+        self.assertEqual(
+            await balancer.record_extension_transport_failure(token.id),
+            120.0,
         )
 
 
