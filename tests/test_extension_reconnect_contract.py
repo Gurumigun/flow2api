@@ -198,6 +198,34 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn('"Input.dispatchMouseEvent"', background)
         self.assertIn('reportProgress(`trusted_submit:${trustedX}:${trustedY}`)', background)
 
+    def test_trusted_submit_inputs_never_overlap_on_one_tab(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        # A slow trusted click must finish (and detach) before trusted Enter
+        # attaches, otherwise Chrome rejects Enter with "Another debugger is
+        # already attached".
+        self.assertIn("runTrustedFlowInput(tabId, () => dispatchTrustedFlowClick(", background)
+        self.assertIn("runTrustedFlowInput(tabId, () => dispatchTrustedFlowEnter(", background)
+        self.assertIn("await waitForTrustedResult(\"click\"", background)
+        self.assertIn("await waitForTrustedResult(\"enter\"", background)
+
+    def test_trusted_click_remeasures_the_submit_button_after_attaching(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn('submitButton.setAttribute("data-flow2api-trusted-submit", String(requestId || "").replace(/[^\\w-]/g, ""))', background)
+        self.assertIn('"Runtime.evaluate"', background)
+        self.assertIn("locateTrustedSubmitCenter(", background)
+
+    def test_cookie_banner_is_declined_before_it_can_swallow_the_submit_click(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        # Flow's cookie bar covers the submit button, so trusted clicks hit
+        # its "later" button instead. Decline it (never accept) first.
+        self.assertIn(".glue-cookie-notification-bar__reject", background)
+        self.assertNotIn(".glue-cookie-notification-bar__accept", background)
+        self.assertIn("await declineCookieBanner();", background)
+        self.assertIn(",hit=${describeSubmitHit()}", background)
+
     def test_image_result_validation_runs_after_the_page_script_returns(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
 
