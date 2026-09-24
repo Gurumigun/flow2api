@@ -1180,7 +1180,45 @@ function sendFlowSubmitProgress(data, socket, phase) {
     }, socket);
 }
 
-function dispatchTrustedFlowClick(tabId, x, y) {
+// Chrome allows one debugger session per tab. A slow trusted click (bringToFront
+// on a background window can take seconds) must detach before trusted Enter
+// attaches, so every trusted input on a tab runs strictly in order.
+const trustedFlowInputQueues = new Map();
+
+function runTrustedFlowInput(tabId, task) {
+    const key = Number(tabId);
+    const previous = trustedFlowInputQueues.get(key) || Promise.resolve();
+    const run = previous.catch(() => {}).then(task);
+    const settled = run.catch(() => {});
+    trustedFlowInputQueues.set(key, settled);
+    settled.then(() => {
+        if (trustedFlowInputQueues.get(key) === settled) trustedFlowInputQueues.delete(key);
+    });
+    return run;
+}
+
+// Attaching shows Chrome's debugging infobar and bringToFront can relayout the
+// page, so the coordinates measured before attaching may no longer hit the button.
+async function locateTrustedSubmitCenter(sendCommand, requestId) {
+    try {
+        const response = await sendCommand("Runtime.evaluate", {
+            expression: `(() => {
+                const button = document.querySelector('[data-flow2api-trusted-submit="${String(requestId || "").replace(/[^\w-]/g, "")}"]');
+                if (!button || !button.isConnected) return null;
+                const rect = button.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return null;
+                return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+            })()`,
+            returnByValue: true,
+        });
+        const value = response && response.result && response.result.value;
+        return value && Number.isFinite(value.x) && Number.isFinite(value.y) ? value : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function dispatchTrustedFlowClick(tabId, x, y, requestId) {
     const target = { tabId: Number(tabId) };
     const attach = () => new Promise((resolve, reject) => {
         chrome.debugger.attach(target, "1.3", () => {
@@ -1190,10 +1228,10 @@ function dispatchTrustedFlowClick(tabId, x, y) {
         });
     });
     const sendCommand = (method, params) => new Promise((resolve, reject) => {
-        chrome.debugger.sendCommand(target, method, params, () => {
+        chrome.debugger.sendCommand(target, method, params, result => {
             const error = chrome.runtime.lastError;
             if (error) reject(new Error(error.message));
-            else resolve();
+            else resolve(result);
         });
     });
     const detach = () => new Promise(resolve => {
@@ -1206,6 +1244,8 @@ function dispatchTrustedFlowClick(tabId, x, y) {
         await attach();
         try {
             await sendCommand("Page.bringToFront", {});
+            const center = await locateTrustedSubmitCenter(sendCommand, requestId);
+            if (center) ({ x, y } = center);
             await sendCommand("Input.dispatchMouseEvent", {
                 type: "mouseMoved", x, y, button: "none", buttons: 0,
             });
@@ -1231,10 +1271,10 @@ function dispatchTrustedFlowEnter(tabId) {
         });
     });
     const sendCommand = (method, params) => new Promise((resolve, reject) => {
-        chrome.debugger.sendCommand(target, method, params, () => {
+        chrome.debugger.sendCommand(target, method, params, result => {
             const error = chrome.runtime.lastError;
             if (error) reject(new Error(error.message));
-            else resolve();
+            else resolve(result);
         });
     });
     const detach = () => new Promise(resolve => {
@@ -1315,7 +1355,7 @@ function forwardFlowSubmitProgress(message, sender) {
     if (trustedSubmit) {
         const x = Number(trustedSubmit[1]);
         const y = Number(trustedSubmit[2]);
-        dispatchTrustedFlowClick(tabId, x, y)
+        runTrustedFlowInput(tabId, () => dispatchTrustedFlowClick(tabId, x, y, requestId))
             .then(() => recordTrustedSubmitResult(tabId, requestId, "click", true))
             .catch(error => {
                 console.warn("[Flow2API] Trusted Flow submit click failed:", error);
@@ -1325,7 +1365,7 @@ function forwardFlowSubmitProgress(message, sender) {
         return;
     }
     if (phase === "trusted_enter") {
-        dispatchTrustedFlowEnter(tabId)
+        runTrustedFlowInput(tabId, () => dispatchTrustedFlowEnter(tabId))
             .then(() => recordTrustedSubmitResult(tabId, requestId, "enter", true))
             .catch(error => {
                 console.warn("[Flow2API] Trusted Flow submit Enter failed:", error);
@@ -2249,6 +2289,24 @@ async function handleSubmitFlowRequest(data, socket) {
                         30000,
                         "enabled Flow image submit button"
                     );
+                    // Flow's cookie bar sits over the submit button and swallows the
+                    // trusted click. Decline it (never accept) before submitting.
+                    const declineCookieBanner = async () => {
+                        const reject = document.querySelector(".glue-cookie-notification-bar__reject");
+                        if (!reject || !isVisible(reject)) return;
+                        reject.click();
+                        reportProgress("cookie_banner_declined");
+                        await pause(500);
+                    };
+                    const describeSubmitHit = () => {
+                        const rect = submitButton.getBoundingClientRect();
+                        const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+                        if (!hit) return "none";
+                        if (submitButton.contains(hit) || hit.contains(submitButton)) return "submit";
+                        const className = typeof hit.className === "string" ? hit.className.trim().split(/\s+/)[0] : "";
+                        return `${hit.tagName.toLowerCase()}${className ? `.${className}` : ""}`.slice(0, 60);
+                    };
+                    await declineCookieBanner();
                     clickElement(submitButton);
                     reportProgress("submitted");
 
@@ -2310,17 +2368,32 @@ async function handleSubmitFlowRequest(data, socket) {
                         reportProgress("submit_enter_retry");
                         submissionAccepted = await waitForSubmissionAcceptance(2000);
                     }
+                    // Trusted input runs in the extension worker and can take several
+                    // seconds; start the acknowledgement window only once it finished.
+                    const waitForTrustedResult = async (operation, budgetMs) => {
+                        const deadline = Date.now() + budgetMs;
+                        while (Date.now() < deadline) {
+                            const trusted = window.__FLOW2API_TRUSTED_SUBMIT_RESULT__;
+                            if (trusted?.requestId === String(requestId || "") && trusted.results?.[operation]) return;
+                            if (submissionWasAccepted()) return;
+                            await pause(200);
+                        }
+                    };
                     if (!submissionAccepted) {
+                        await declineCookieBanner();
                         const rect = submitButton.getBoundingClientRect();
                         const trustedX = Math.max(0, Math.round(rect.left + rect.width / 2));
                         const trustedY = Math.max(0, Math.round(rect.top + rect.height / 2));
                         window.__FLOW2API_TRUSTED_SUBMIT_RESULT__ = null;
+                        submitButton.setAttribute("data-flow2api-trusted-submit", String(requestId || "").replace(/[^\w-]/g, ""));
                         reportProgress(`trusted_submit:${trustedX}:${trustedY}`);
+                        await waitForTrustedResult("click", 20000);
                         submissionAccepted = await waitForSubmissionAcceptance(4000);
                     }
                     if (!submissionAccepted) {
                         submitButton.focus();
                         reportProgress("trusted_enter");
+                        await waitForTrustedResult("enter", 20000);
                         submissionAccepted = await waitForSubmissionAcceptance(4000);
                     }
                     if (!submissionAccepted) {
@@ -2338,7 +2411,7 @@ async function handleSubmitFlowRequest(data, socket) {
                             return `${operation}=${result ? result.ok ? "ok" : `error:${result.error || "unknown"}` : "pending"}`;
                         }).join(",");
                         throw new Error(
-                            `Flow did not acknowledge submit (editors=${visibleEditors.length},distance=${distance},form=${Number(Boolean(form))},trusted=${trustedStatus})`
+                            `Flow did not acknowledge submit (editors=${visibleEditors.length},distance=${distance},form=${Number(Boolean(form))},hit=${describeSubmitHit()},trusted=${trustedStatus})`
                         );
                     }
                     reportProgress("submission_accepted");
