@@ -154,6 +154,22 @@ class NativeVideoUploadTimeoutTests(unittest.IsolatedAsyncioTestCase):
   self.assertEqual(caught.exception.code,'extension_flow_stalled')
   self.assertIn('30.0s',str(caught.exception))
 
+ async def test_stalled_phase_error_includes_last_progress_detail(self):
+  import asyncio
+  from src.services.browser_captcha_extension import ExtensionCaptchaService, ExtensionCaptchaError
+  service=ExtensionCaptchaService(None)
+  service._pending_flow_activity['r1']=(100,'waiting_for_result',100)
+  service._pending_flow_detail['r1']='f1:s3:error:download failed (HTTP 403)'
+  future=asyncio.get_running_loop().create_future()
+  with patch('src.services.browser_captcha_extension.config') as config, patch('src.services.browser_captcha_extension.time') as clock:
+   clock.monotonic.side_effect=[131,131]
+   config.extension_progress_stall_timeout_seconds=60
+   config.extension_image_result_timeout_seconds=30
+   with self.assertRaises(ExtensionCaptchaError) as caught:
+    await service._wait_for_flow_submit_result(future=future,req_id='r1',timeout=180,supports_progress=True,max_phase_duration=95)
+  self.assertIn("'waiting_for_result'",str(caught.exception))
+  self.assertIn('f1:s3:error:download failed (HTTP 403)',str(caught.exception))
+
 class VideoOnboardingTests(unittest.TestCase):
  def test_onboarding_is_reported_without_accepting_or_blocking_image_connections(self):
   from src.services.browser_captcha_extension import ExtensionCaptchaService, ExtensionCaptchaError

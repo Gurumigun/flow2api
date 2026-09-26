@@ -216,6 +216,39 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn('"Runtime.evaluate"', background)
         self.assertIn("locateTrustedSubmitCenter(", background)
 
+    def test_trusted_inputs_render_a_frame_before_hitting_a_hidden_flow_tab(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        # Hidden Flow tabs never advance animations, so the loading overlay
+        # stays over the page and the agent panel stays off-screen. Force one
+        # rendered frame before measuring and dispatching trusted input.
+        self.assertIn("async function renderFlowFrame(sendCommand)", background)
+        self.assertIn('"Page.captureScreenshot"', background)
+        click = background[background.index("function dispatchTrustedFlowClick("):background.index("function dispatchTrustedFlowEnter(")]
+        self.assertLess(click.index("await renderFlowFrame(sendCommand);"), click.index("locateTrustedSubmitCenter("))
+        enter_start = background.index("function dispatchTrustedFlowEnter(")
+        enter = background[enter_start:background.index("Input.dispatchKeyEvent", enter_start)]
+        self.assertIn("await renderFlowFrame(sendCommand);", enter)
+
+    def test_image_result_wait_reports_candidate_and_verdict_detail(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        # The server times out on the exact "waiting_for_result" phase, so the
+        # diagnostics travel in a separate detail field.
+        self.assertIn("function sendFlowSubmitProgress(data, socket, phase, detail = \"\")", background)
+        self.assertIn("detail: String(detail || \"\").slice(0, 120)", background)
+        self.assertIn("`f${fresh.length}:s${stablePolls}:${lastVerdict}`", background)
+
+    def test_hidden_tab_is_rendered_while_no_result_card_has_appeared(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        # A hidden Flow tab may never mount the new chat result without a
+        # rendered frame, and the agent may answer with text instead.
+        self.assertIn("function renderFlowTabFrame(tabId)", background)
+        self.assertIn("runTrustedFlowInput(tabId, () => renderFlowTabFrame(tabId))", background)
+        self.assertIn("if (!page.generationActive && !page.cards && ++idlePolls % 4 === 0)", background)
+        self.assertIn(":${page.lastText}", background)
+
     def test_cookie_banner_is_declined_before_it_can_swallow_the_submit_click(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
 

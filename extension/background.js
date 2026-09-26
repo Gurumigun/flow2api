@@ -932,9 +932,15 @@ async function readCurrentFlowImageCandidates(tabId, expectedRequestId) {
                         || /generating (?:an )?image|이미지 생성 중|이미지를 생성 중/.test(label);
                 });
             submission.observed ||= generationActive;
+            let cards = 0;
+            let loaded = 0;
             document.querySelectorAll("img").forEach(image => {
                 if (!submission.nodes.has(image)
-                    && /^(?:option|옵션)\s*\d+$/i.test(normalizedText(image.alt))) image.loading = "eager";
+                    && /^(?:option|옵션)\s*\d+$/i.test(normalizedText(image.alt))) {
+                    image.loading = "eager";
+                    cards++;
+                    if (image.complete && image.naturalWidth) loaded++;
+                }
                 if (submission.nodes.has(image) || !image.complete || !image.naturalWidth
                     || image.closest('flow-prompt-box, flow-add-menu-popover-content, [contenteditable="true"]')) return;
                 if (![image.alt, image.getAttribute?.('aria-label')].some(label => /^(?:option|옵션)\s*\d+$/i.test(normalizedText(label)))) return;
@@ -988,13 +994,19 @@ async function readCurrentFlowImageCandidates(tabId, expectedRequestId) {
                     // Ignore unrelated or malformed page images.
                 }
             });
-            return { generationActive: generationActive || !submission.observed, assets: Array.from(assets.values()).slice(0, 32) };
+            const agentTexts = document.querySelectorAll("flow-chat-bubble flow-a2ui-text");
+            const lastText = normalizedText(agentTexts[agentTexts.length - 1]?.textContent)
+                .replace(/https?:\/\/\S+/g, "<url>").replace(/:/g, " ").slice(0, 40);
+            return { generationActive: generationActive || !submission.observed, assets: Array.from(assets.values()).slice(0, 32), cards, loaded, lastText };
         },
     });
     const payload = results && results[0] && results[0].result;
     return {
         generationActive: Boolean(payload && payload.generationActive),
         assets: Array.isArray(payload && payload.assets) ? payload.assets : [],
+        cards: Number(payload && payload.cards) || 0,
+        loaded: Number(payload && payload.loaded) || 0,
+        lastText: String(payload && payload.lastText || ""),
     };
 }
 
@@ -1007,20 +1019,28 @@ async function waitForValidatedFlowImage(tabId, responseText, validator, data, s
     const deadline = Date.now() + Math.min(300000, Math.max(1000, timeoutMs));
     let stableIds = "";
     let stablePolls = 0;
+    // Last non-accepted verdict, reported without image URLs.
+    let lastVerdict = "-";
+    let idlePolls = 0;
     while (Date.now() < deadline) {
         if (cancelledFlowSubmitRequestIds.has(String(data.req_id || ""))) {
             throw new Error("Flow browser submit cancelled");
         }
         const page = await readCurrentFlowImageCandidates(tabId, String(data.req_id || ""));
-        sendFlowSubmitProgress(
-            data,
-            socket,
-            page.generationActive ? "generation_active" : "waiting_for_result",
-        );
         const fresh = page.assets.filter(asset => !ignored.has(String(asset.identity || "")));
         const ids = fresh.map(asset => String(asset.identity || "")).sort().join(",");
         stablePolls = ids && ids === stableIds ? stablePolls + 1 : ids ? 1 : 0;
         stableIds = ids;
+        sendFlowSubmitProgress(
+            data,
+            socket,
+            page.generationActive ? "generation_active" : "waiting_for_result",
+            `c${page.cards}:l${page.loaded}:` + `f${fresh.length}:s${stablePolls}:${lastVerdict}` + `:${page.lastText}`,
+        );
+        // Hidden tabs do not render, so the new chat result may never mount.
+        if (!page.generationActive && !page.cards && ++idlePolls % 4 === 0) {
+            await runTrustedFlowInput(tabId, () => renderFlowTabFrame(tabId)).catch(() => {});
+        }
         if (stablePolls >= 3 && !page.generationActive) {
             const accepted = [];
             for (const asset of fresh) {
@@ -1040,6 +1060,7 @@ async function waitForValidatedFlowImage(tabId, responseText, validator, data, s
                 };
                 const verdict = await validator.check(asset);
                 if (verdict.status === "accepted") accepted.push(candidate);
+                else lastVerdict = `${verdict.status}:${verdict.reason || ""}`.replace(/https?:\/\/\S+/g, "<url>");
                 if (verdict.status === "reference") ignored.add(String(asset.identity || ""));
             }
             if (accepted.length > 1) throw new Error("Flow returned ambiguous new image results");
@@ -1172,11 +1193,12 @@ async function handleGetSessionCookie(data, socket) {
     }
 }
 
-function sendFlowSubmitProgress(data, socket, phase) {
+function sendFlowSubmitProgress(data, socket, phase, detail = "") {
     sendSocketMessage({
         type: "flow_submit_progress",
         req_id: data.req_id,
         phase: String(phase || "active").slice(0, 64),
+        detail: String(detail || "").slice(0, 120),
     }, socket);
 }
 
@@ -1218,6 +1240,42 @@ async function locateTrustedSubmitCenter(sendCommand, requestId) {
     }
 }
 
+// Chrome stops rendering hidden or occluded tabs, so Flow's animations never
+// finish: the loading overlay stays over the page and the agent panel stays
+// off-screen. Capturing a frame advances them to their end state.
+async function renderFlowFrame(sendCommand) {
+    try {
+        await sendCommand("Page.captureScreenshot", {
+            format: "jpeg", quality: 1, optimizeForSpeed: true,
+        });
+        await sleep(500);
+    } catch (_) {
+        // Input can still land on an already-rendered page.
+    }
+}
+
+function renderFlowTabFrame(tabId) {
+    const target = { tabId: Number(tabId) };
+    const sendCommand = (method, params) => new Promise((resolve, reject) => {
+        chrome.debugger.sendCommand(target, method, params, result => {
+            const error = chrome.runtime.lastError;
+            if (error) reject(new Error(error.message));
+            else resolve(result);
+        });
+    });
+    return new Promise(resolve => {
+        chrome.debugger.attach(target, "1.3", () => {
+            if (chrome.runtime.lastError) return resolve();
+            renderFlowFrame(sendCommand).finally(() => {
+                chrome.debugger.detach(target, () => {
+                    void chrome.runtime.lastError;
+                    resolve();
+                });
+            });
+        });
+    });
+}
+
 function dispatchTrustedFlowClick(tabId, x, y, requestId) {
     const target = { tabId: Number(tabId) };
     const attach = () => new Promise((resolve, reject) => {
@@ -1244,6 +1302,7 @@ function dispatchTrustedFlowClick(tabId, x, y, requestId) {
         await attach();
         try {
             await sendCommand("Page.bringToFront", {});
+            await renderFlowFrame(sendCommand);
             const center = await locateTrustedSubmitCenter(sendCommand, requestId);
             if (center) ({ x, y } = center);
             await sendCommand("Input.dispatchMouseEvent", {
@@ -1287,6 +1346,7 @@ function dispatchTrustedFlowEnter(tabId) {
         await attach();
         try {
             await sendCommand("Page.bringToFront", {});
+            await renderFlowFrame(sendCommand);
             await sendCommand("Input.dispatchKeyEvent", {
                 type: "rawKeyDown", key: "Enter", code: "Enter",
                 windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
