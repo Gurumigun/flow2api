@@ -46,6 +46,8 @@ class ExtensionCaptchaService:
         # Last heartbeat, current phase, and when that phase started. Repeated
         # heartbeats prove the worker is alive, but not that Flow is advancing.
         self._pending_flow_activity: dict[str, tuple[float, str, float]] = {}
+        # Latest diagnostic detail per request, surfaced when a phase stalls.
+        self._pending_flow_detail: dict[str, str] = {}
         # A Chrome profile represents one Google account. Serialize requests
         # per route and space them out so a burst cannot open many hidden Flow
         # tabs for the same account at once.
@@ -125,6 +127,7 @@ class ExtensionCaptchaService:
                     if owner_websocket is websocket:
                         self.pending_requests.pop(req_id, None)
                         self._pending_flow_activity.pop(req_id, None)
+                        self._pending_flow_detail.pop(req_id, None)
                         if not future.done():
                             future.set_exception(ExtensionCaptchaError(
                                 "Chrome Extension disconnected during Flow submit",
@@ -518,6 +521,9 @@ class ExtensionCaptchaService:
                 if previous and previous[1] == phase:
                     phase_started_at = previous[2] if len(previous) > 2 else previous[0]
                 self._pending_flow_activity[req_id] = (now, phase, phase_started_at)
+                detail = str(payload.get("detail") or "").strip()[:120]
+                if detail:
+                    self._pending_flow_detail[req_id] = detail
                 return
 
             if req_id and req_id in self.pending_requests:
@@ -804,9 +810,10 @@ class ExtensionCaptchaService:
                     code="extension_flow_timeout",
                 )
             if phase_remaining <= 0:
+                detail = self._pending_flow_detail.get(req_id)
                 raise ExtensionCaptchaError(
                     f"Chrome extension Flow phase '{last_phase}' did not change for "
-                    f"{phase_timeout:.1f}s",
+                    f"{phase_timeout:.1f}s" + (f" ({detail})" if detail else ""),
                     code="extension_flow_stalled",
                 )
             if stall_remaining <= 0:
@@ -1108,6 +1115,7 @@ class ExtensionCaptchaService:
                     await self._cancel_flow_submit(conn, req_id)
                 self.pending_requests.pop(req_id, None)
                 self._pending_flow_activity.pop(req_id, None)
+                self._pending_flow_detail.pop(req_id, None)
                 if not future.done():
                     future.cancel()
 
